@@ -562,7 +562,7 @@ class SidebarItem(tk.Frame):
             font=(Theme.FONT, 10),
             anchor="w",
             padx=padding_left - 4,
-            pady=10,
+            pady=7,
         )
         self.label.pack(side="left", fill="x", expand=True)
 
@@ -635,7 +635,7 @@ class SidebarSection(tk.Frame):
         super().__init__(parent, bg=Theme.SIDEBAR_BG, **kwargs)
 
         divider = tk.Frame(self, bg=Theme.SIDEBAR_DIVIDER, height=1)
-        divider.pack(fill="x", padx=20, pady=(14, 0))
+        divider.pack(fill="x", padx=20, pady=(10, 0))
 
         self.label = tk.Label(
             self,
@@ -645,7 +645,7 @@ class SidebarSection(tk.Frame):
             font=(Theme.FONT, 8, "bold"),
             anchor="w",
         )
-        self.label.pack(fill="x", padx=20, pady=(8, 4))
+        self.label.pack(fill="x", padx=20, pady=(6, 2))
 
 
 class SidebarBadge(tk.Frame):
@@ -1164,11 +1164,23 @@ class EmailMonitorApp:
         self.content = tk.Frame(self.main_area, bg=Theme.BG_SECONDARY)
         self.content.pack(fill="both", expand=True, padx=0, pady=0)
 
+        # Global mousewheel handler — routes scroll events to whichever
+        # scrollable area (sidebar or content page) the cursor is over.
+        self._active_scroll_canvas = None
+
+        def _on_global_mousewheel(event):
+            if self._active_scroll_canvas:
+                self._active_scroll_canvas.yview_scroll(
+                    int(-1 * (event.delta / 120)), "units"
+                )
+
+        self.root.bind_all("<MouseWheel>", _on_global_mousewheel)
+
     def _create_sidebar(self):
-        """Create the sidebar navigation."""
-        # Logo area
+        """Create the sidebar navigation with scrollable nav area."""
+        # Logo area (fixed at top)
         title_frame = tk.Frame(self.sidebar, bg=Theme.SIDEBAR_BG)
-        title_frame.pack(fill="x", pady=(24, 4))
+        title_frame.pack(fill="x", pady=(20, 4))
 
         tk.Label(
             title_frame, text="E2NB",
@@ -1182,8 +1194,36 @@ class EmailMonitorApp:
             font=(Theme.FONT, 9), padx=20,
         ).pack(anchor="w")
 
-        # Configuration
-        SidebarSection(self.sidebar, "Configuration").pack(fill="x")
+        # Scrollable navigation area (fills remaining space)
+        self._sb_canvas = tk.Canvas(
+            self.sidebar, bg=Theme.SIDEBAR_BG, highlightthickness=0,
+        )
+        self._sb_canvas.pack(fill="both", expand=True)
+
+        nav = tk.Frame(self._sb_canvas, bg=Theme.SIDEBAR_BG)
+        sb_canvas_win = self._sb_canvas.create_window(
+            (0, 0), window=nav, anchor="nw",
+        )
+
+        def _on_sb_canvas_config(event):
+            self._sb_canvas.itemconfigure(sb_canvas_win, width=event.width)
+        self._sb_canvas.bind("<Configure>", _on_sb_canvas_config)
+
+        nav.bind("<Configure>", lambda e: self._sb_canvas.configure(
+            scrollregion=self._sb_canvas.bbox("all"),
+        ))
+
+        # Route mousewheel to sidebar when cursor is over it
+        def _enter_sb(event):
+            self._active_scroll_canvas = self._sb_canvas
+        def _leave_sb(event):
+            if self._active_scroll_canvas is self._sb_canvas:
+                self._active_scroll_canvas = None
+        self._sb_canvas.bind("<Enter>", _enter_sb)
+        self._sb_canvas.bind("<Leave>", _leave_sb)
+
+        # Configuration section
+        SidebarSection(nav, "Configuration").pack(fill="x")
 
         nav_items = [
             ("email", "Email Settings", 0, None, "Configure IMAP server and credentials"),
@@ -1191,14 +1231,14 @@ class EmailMonitorApp:
         ]
         for key, text, indent, var, tip in nav_items:
             item = SidebarItem(
-                self.sidebar, text, lambda k=key: self._show_page(k),
+                nav, text, lambda k=key: self._show_page(k),
                 indent, status_var=var, tooltip=tip,
             )
             item.pack(fill="x")
             self.nav_items[key] = item
 
-        # Notifications
-        SidebarSection(self.sidebar, "Notifications").pack(fill="x")
+        # Notifications section
+        SidebarSection(nav, "Notifications").pack(fill="x")
 
         notification_items = [
             ("sms", "Twilio SMS", 0, self.twilio_sms_var, "SMS notifications via Twilio"),
@@ -1211,34 +1251,30 @@ class EmailMonitorApp:
         ]
         for key, text, indent, var, tip in notification_items:
             item = SidebarItem(
-                self.sidebar, text, lambda k=key: self._show_page(k),
+                nav, text, lambda k=key: self._show_page(k),
                 indent, status_var=var, tooltip=tip,
             )
             item.pack(fill="x")
             self.nav_items[key] = item
 
         # Services badge
-        self._services_badge = SidebarBadge(self.sidebar)
+        self._services_badge = SidebarBadge(nav)
         self._services_badge.pack(fill="x", pady=(4, 0))
 
-        # Monitor
-        SidebarSection(self.sidebar, "Monitor").pack(fill="x")
+        # Monitor section
+        SidebarSection(nav, "Monitor").pack(fill="x")
 
         item = SidebarItem(
-            self.sidebar, "Logs",
+            nav, "Logs",
             lambda: self._show_page("logs"),
             0, tooltip="View monitoring activity logs (Ctrl+L)",
         )
         item.pack(fill="x")
         self.nav_items["logs"] = item
 
-        # Spacer to push shortcut hints to bottom
-        spacer = tk.Frame(self.sidebar, bg=Theme.SIDEBAR_BG)
-        spacer.pack(fill="both", expand=True)
-
-        # Keyboard shortcut hints
-        hints_frame = tk.Frame(self.sidebar, bg=Theme.SIDEBAR_BG)
-        hints_frame.pack(fill="x", pady=(0, 16))
+        # Keyboard shortcut hints (at end of scrollable area)
+        hints_frame = tk.Frame(nav, bg=Theme.SIDEBAR_BG)
+        hints_frame.pack(fill="x", pady=(12, 16))
 
         for shortcut, desc in [("Ctrl+S", "Save"), ("Ctrl+L", "Logs")]:
             row = tk.Frame(hints_frame, bg=Theme.SIDEBAR_BG)
@@ -1362,7 +1398,7 @@ class EmailMonitorApp:
         scrollable_outer = tk.Frame(canvas, bg=Theme.BG_SECONDARY)
         scrollable_outer.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
 
-        self._canvas_window = canvas.create_window((0, 0), window=scrollable_outer, anchor="nw")
+        canvas_window = canvas.create_window((0, 0), window=scrollable_outer, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
 
         canvas.pack(side="left", fill="both", expand=True)
@@ -1372,14 +1408,18 @@ class EmailMonitorApp:
         inner = tk.Frame(scrollable_outer, bg=Theme.BG_SECONDARY)
         inner.pack(fill="x", expand=True, padx=36, pady=28)
 
-        # Mouse wheel scrolling
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        # Route mousewheel to this content canvas when cursor is over it
+        def _enter_content(event):
+            self._active_scroll_canvas = canvas
+        def _leave_content(event):
+            if self._active_scroll_canvas is canvas:
+                self._active_scroll_canvas = None
+        canvas.bind("<Enter>", _enter_content)
+        canvas.bind("<Leave>", _leave_content)
 
         # Keep scrollable frame width matched to canvas
         def _on_canvas_configure(event):
-            canvas.itemconfigure(self._canvas_window, width=event.width)
+            canvas.itemconfigure(canvas_window, width=event.width)
         canvas.bind("<Configure>", _on_canvas_configure)
 
         self.pages[name] = container
