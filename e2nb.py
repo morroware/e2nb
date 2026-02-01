@@ -78,7 +78,6 @@ class Theme:
     SIDEBAR_TEXT_ACTIVE = "#ffffff"
     SIDEBAR_HOVER = "#1e293b"
     SIDEBAR_ACTIVE = "#3b82f6"
-    SIDEBAR_ACTIVE_BG = "rgba(59,130,246,0.15)"
     SIDEBAR_SECTION = "#64748b"
     SIDEBAR_DIVIDER = "#1e293b"
 
@@ -696,11 +695,6 @@ class ToggleSwitch(tk.Frame):
         cy = h / 2
         kr = self._knob_r
 
-        # Shadow
-        self.canvas.create_oval(
-            cx - kr, cy - kr + 1, cx + kr, cy + kr + 1,
-            fill="#00000010", outline="",
-        )
         # Knob
         self.canvas.create_oval(
             cx - kr, cy - kr, cx + kr, cy + kr,
