@@ -15,6 +15,31 @@ from __future__ import annotations
 
 import os
 import sys
+
+# ---------------------------------------------------------------------------
+# DPI Configuration — must run BEFORE importing tkinter
+# ---------------------------------------------------------------------------
+# Python 3.8+ on Windows declares per-monitor DPI awareness in its manifest.
+# Tkinter does not auto-scale pixel-based widget dimensions for high DPI, so
+# we override to DPI-unaware mode and let Windows handle the scaling.
+if sys.platform == "win32":
+    try:
+        import ctypes
+        try:
+            # UNAWARE_GDISCALED: best render quality (Windows 10 1809+)
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-5))
+        except (AttributeError, OSError):
+            try:
+                # Basic DPI-unaware fallback
+                ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-1))
+            except (AttributeError, OSError):
+                try:
+                    ctypes.windll.shcore.SetProcessDpiAwareness(0)
+                except (AttributeError, OSError):
+                    pass
+    except Exception:
+        pass
+
 import queue
 import threading
 import tkinter as tk
@@ -42,25 +67,6 @@ from e2nb_core import (
     DEFAULT_MAX_SMS_LENGTH,
     DEFAULT_IMAP_PORT,
 )
-
-
-# =============================================================================
-# DPI Awareness (Windows)
-# =============================================================================
-
-def enable_dpi_awareness():
-    """Enable DPI awareness on Windows for crisp rendering on high-DPI displays."""
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        except (AttributeError, OSError):
-            try:
-                ctypes.windll.user32.SetProcessDPIAware()
-            except (AttributeError, OSError):
-                pass
-
-enable_dpi_awareness()
 
 
 # =============================================================================
