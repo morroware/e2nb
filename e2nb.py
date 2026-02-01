@@ -153,11 +153,9 @@ class SidebarSection(tk.Frame):
             bg=Theme.SIDEBAR_BG,
             fg=Theme.SIDEBAR_SECTION,
             font=("Segoe UI", 8, "bold"),
-            anchor="w",
-            padx=16,
-            pady=(16, 4)
+            anchor="w"
         )
-        self.label.pack(fill="x")
+        self.label.pack(fill="x", padx=16, pady=(16, 4))
 
 
 # =============================================================================
