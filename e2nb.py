@@ -15,12 +15,10 @@ from __future__ import annotations
 
 import queue
 import threading
-import time
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
-import tkinter.font as tkFont
 from datetime import datetime
-from typing import Optional, Callable, Any
+from typing import Optional, Dict, Callable
 
 # Import shared core module
 from e2nb_core import (
@@ -36,7 +34,6 @@ from e2nb_core import (
     check_email_filter,
     EmailNotification,
     NotificationDispatcher,
-    NotificationResult,
     EmailConfig,
     test_imap_connection,
     DEFAULT_CHECK_INTERVAL,
@@ -46,237 +43,156 @@ from e2nb_core import (
 
 
 # =============================================================================
-# Color Scheme and Styling
+# Color Scheme
 # =============================================================================
 
 class Theme:
     """Application color theme."""
-    # Primary colors
-    PRIMARY = "#2563eb"
-    PRIMARY_HOVER = "#1d4ed8"
-    PRIMARY_LIGHT = "#dbeafe"
+    # Sidebar
+    SIDEBAR_BG = "#1e293b"
+    SIDEBAR_TEXT = "#cbd5e1"
+    SIDEBAR_TEXT_ACTIVE = "#ffffff"
+    SIDEBAR_HOVER = "#334155"
+    SIDEBAR_ACTIVE = "#3b82f6"
+    SIDEBAR_SECTION = "#94a3b8"
 
-    # Status colors
-    SUCCESS = "#059669"
-    SUCCESS_LIGHT = "#d1fae5"
-    WARNING = "#d97706"
-    WARNING_LIGHT = "#fef3c7"
-    ERROR = "#dc2626"
-    ERROR_LIGHT = "#fee2e2"
-
-    # Neutral colors
-    BG_PRIMARY = "#f8fafc"
-    BG_SECONDARY = "#ffffff"
-    BG_TERTIARY = "#f1f5f9"
+    # Main content
+    BG_PRIMARY = "#ffffff"
+    BG_SECONDARY = "#f8fafc"
+    BG_INPUT = "#ffffff"
     TEXT_PRIMARY = "#1e293b"
     TEXT_SECONDARY = "#64748b"
     TEXT_MUTED = "#94a3b8"
     BORDER = "#e2e8f0"
 
+    # Accent colors
+    PRIMARY = "#3b82f6"
+    PRIMARY_HOVER = "#2563eb"
+    SUCCESS = "#10b981"
+    SUCCESS_BG = "#d1fae5"
+    WARNING = "#f59e0b"
+    ERROR = "#ef4444"
+    ERROR_BG = "#fee2e2"
+
     # Log colors
-    LOG_INFO = "#0369a1"
-    LOG_WARNING = "#b45309"
-    LOG_ERROR = "#b91c1c"
-    LOG_SUCCESS = "#047857"
+    LOG_INFO = "#0ea5e9"
+    LOG_WARNING = "#f59e0b"
+    LOG_ERROR = "#ef4444"
+    LOG_SUCCESS = "#10b981"
 
 
-class StyleManager:
-    """Manages application styling."""
+# =============================================================================
+# Sidebar Navigation
+# =============================================================================
 
-    @staticmethod
-    def configure_styles():
-        """Configure ttk styles for the application."""
-        style = ttk.Style()
+class SidebarItem(tk.Frame):
+    """A clickable sidebar navigation item."""
 
-        # Try to use a modern theme
-        available_themes = style.theme_names()
-        if 'clam' in available_themes:
-            style.theme_use('clam')
-        elif 'alt' in available_themes:
-            style.theme_use('alt')
+    def __init__(self, parent, text: str, command: Callable, indent: int = 0, **kwargs):
+        super().__init__(parent, bg=Theme.SIDEBAR_BG, **kwargs)
 
-        # Configure frame styles
-        style.configure(
-            "Card.TFrame",
-            background=Theme.BG_SECONDARY,
-            relief="flat"
+        self.command = command
+        self.active = False
+
+        padding_left = 16 + (indent * 16)
+
+        self.label = tk.Label(
+            self,
+            text=text,
+            bg=Theme.SIDEBAR_BG,
+            fg=Theme.SIDEBAR_TEXT,
+            font=("Segoe UI", 10),
+            anchor="w",
+            padx=padding_left,
+            pady=8
         )
+        self.label.pack(fill="x")
 
-        style.configure(
-            "TFrame",
-            background=Theme.BG_PRIMARY
-        )
+        # Bind click events
+        self.bind("<Button-1>", self._on_click)
+        self.label.bind("<Button-1>", self._on_click)
 
-        # Configure label styles
-        style.configure(
-            "TLabel",
-            background=Theme.BG_PRIMARY,
-            foreground=Theme.TEXT_PRIMARY,
-            font=('Segoe UI', 10)
-        )
+        # Bind hover events
+        self.bind("<Enter>", self._on_enter)
+        self.label.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.label.bind("<Leave>", self._on_leave)
 
-        style.configure(
-            "Header.TLabel",
-            background=Theme.BG_PRIMARY,
-            foreground=Theme.TEXT_PRIMARY,
-            font=('Segoe UI', 12, 'bold')
-        )
+    def _on_click(self, event):
+        self.command()
 
-        style.configure(
-            "Subheader.TLabel",
-            background=Theme.BG_PRIMARY,
-            foreground=Theme.TEXT_SECONDARY,
-            font=('Segoe UI', 9)
-        )
+    def _on_enter(self, event):
+        if not self.active:
+            self.configure(bg=Theme.SIDEBAR_HOVER)
+            self.label.configure(bg=Theme.SIDEBAR_HOVER)
 
-        # Configure entry styles
-        style.configure(
-            "TEntry",
-            fieldbackground=Theme.BG_SECONDARY,
-            foreground=Theme.TEXT_PRIMARY,
-            borderwidth=1,
-            relief="solid"
-        )
+    def _on_leave(self, event):
+        if not self.active:
+            self.configure(bg=Theme.SIDEBAR_BG)
+            self.label.configure(bg=Theme.SIDEBAR_BG)
 
-        # Configure button styles
-        style.configure(
-            "TButton",
-            background=Theme.BG_TERTIARY,
-            foreground=Theme.TEXT_PRIMARY,
-            font=('Segoe UI', 10),
-            padding=(12, 6)
-        )
+    def set_active(self, active: bool):
+        self.active = active
+        if active:
+            self.configure(bg=Theme.SIDEBAR_ACTIVE)
+            self.label.configure(bg=Theme.SIDEBAR_ACTIVE, fg=Theme.SIDEBAR_TEXT_ACTIVE)
+        else:
+            self.configure(bg=Theme.SIDEBAR_BG)
+            self.label.configure(bg=Theme.SIDEBAR_BG, fg=Theme.SIDEBAR_TEXT)
 
-        style.configure(
-            "Primary.TButton",
-            background=Theme.PRIMARY,
-            foreground="white",
-            font=('Segoe UI', 10, 'bold'),
-            padding=(16, 8)
-        )
 
-        style.map(
-            "Primary.TButton",
-            background=[('active', Theme.PRIMARY_HOVER)]
-        )
+class SidebarSection(tk.Frame):
+    """A section header in the sidebar."""
 
-        style.configure(
-            "Success.TButton",
-            background=Theme.SUCCESS,
-            foreground="white",
-            font=('Segoe UI', 10, 'bold'),
-            padding=(16, 8)
-        )
+    def __init__(self, parent, text: str, **kwargs):
+        super().__init__(parent, bg=Theme.SIDEBAR_BG, **kwargs)
 
-        style.configure(
-            "Danger.TButton",
-            background=Theme.ERROR,
-            foreground="white",
-            font=('Segoe UI', 10),
-            padding=(16, 8)
+        self.label = tk.Label(
+            self,
+            text=text.upper(),
+            bg=Theme.SIDEBAR_BG,
+            fg=Theme.SIDEBAR_SECTION,
+            font=("Segoe UI", 8, "bold"),
+            anchor="w",
+            padx=16,
+            pady=(16, 4)
         )
-
-        # Configure notebook styles
-        style.configure(
-            "TNotebook",
-            background=Theme.BG_PRIMARY,
-            borderwidth=0
-        )
-
-        style.configure(
-            "TNotebook.Tab",
-            background=Theme.BG_TERTIARY,
-            foreground=Theme.TEXT_PRIMARY,
-            padding=(16, 8),
-            font=('Segoe UI', 10)
-        )
-
-        style.map(
-            "TNotebook.Tab",
-            background=[('selected', Theme.BG_SECONDARY)],
-            foreground=[('selected', Theme.PRIMARY)]
-        )
-
-        # Configure checkbutton styles
-        style.configure(
-            "TCheckbutton",
-            background=Theme.BG_PRIMARY,
-            foreground=Theme.TEXT_PRIMARY,
-            font=('Segoe UI', 10)
-        )
-
-        # Configure labelframe styles
-        style.configure(
-            "TLabelframe",
-            background=Theme.BG_PRIMARY,
-            foreground=Theme.TEXT_PRIMARY
-        )
-
-        style.configure(
-            "TLabelframe.Label",
-            background=Theme.BG_PRIMARY,
-            foreground=Theme.TEXT_PRIMARY,
-            font=('Segoe UI', 10, 'bold')
-        )
-
-        # Status indicator styles
-        style.configure(
-            "StatusActive.TLabel",
-            background=Theme.SUCCESS_LIGHT,
-            foreground=Theme.SUCCESS,
-            font=('Segoe UI', 10, 'bold'),
-            padding=(8, 4)
-        )
-
-        style.configure(
-            "StatusInactive.TLabel",
-            background=Theme.BG_TERTIARY,
-            foreground=Theme.TEXT_MUTED,
-            font=('Segoe UI', 10),
-            padding=(8, 4)
-        )
+        self.label.pack(fill="x")
 
 
 # =============================================================================
 # Custom Widgets
 # =============================================================================
 
-class StatusIndicator(ttk.Frame):
-    """A visual status indicator widget."""
+class FormSection(tk.Frame):
+    """A form section with title and content area."""
 
-    def __init__(self, parent, **kwargs):
-        super().__init__(parent, **kwargs)
-        self.configure(style="Card.TFrame")
+    def __init__(self, parent, title: str, **kwargs):
+        super().__init__(parent, bg=Theme.BG_PRIMARY, **kwargs)
 
-        self.canvas = tk.Canvas(
+        # Title
+        title_label = tk.Label(
             self,
-            width=12,
-            height=12,
-            bg=Theme.BG_SECONDARY,
-            highlightthickness=0
+            text=title,
+            bg=Theme.BG_PRIMARY,
+            fg=Theme.TEXT_PRIMARY,
+            font=("Segoe UI", 11, "bold"),
+            anchor="w"
         )
-        self.canvas.pack(side="left", padx=(0, 8))
+        title_label.pack(fill="x", pady=(0, 12))
 
-        self.label = ttk.Label(self, text="Inactive", style="Subheader.TLabel")
-        self.label.pack(side="left")
-
-        self._indicator = self.canvas.create_oval(2, 2, 10, 10, fill=Theme.TEXT_MUTED, outline="")
-        self._active = False
-
-    def set_active(self, active: bool, text: str = None):
-        """Set the indicator state."""
-        self._active = active
-        color = Theme.SUCCESS if active else Theme.TEXT_MUTED
-        self.canvas.itemconfig(self._indicator, fill=color)
-
-        if text:
-            self.label.configure(text=text)
-        else:
-            self.label.configure(text="Active" if active else "Inactive")
+        # Content frame with border
+        self.content = tk.Frame(
+            self,
+            bg=Theme.BG_SECONDARY,
+            highlightbackground=Theme.BORDER,
+            highlightthickness=1
+        )
+        self.content.pack(fill="x")
 
 
-class FormField(ttk.Frame):
-    """A labeled form field with optional help text."""
+class FormRow(tk.Frame):
+    """A single row in a form with label and input."""
 
     def __init__(
         self,
@@ -284,68 +200,161 @@ class FormField(ttk.Frame):
         label: str,
         help_text: str = "",
         show: str = "",
-        width: int = 40,
         **kwargs
     ):
-        super().__init__(parent, **kwargs)
+        super().__init__(parent, bg=Theme.BG_SECONDARY, **kwargs)
 
-        # Label
-        self.label = ttk.Label(self, text=label, style="TLabel")
-        self.label.pack(anchor="w")
+        # Left side - label
+        label_frame = tk.Frame(self, bg=Theme.BG_SECONDARY, width=180)
+        label_frame.pack(side="left", fill="y", padx=(16, 0), pady=12)
+        label_frame.pack_propagate(False)
 
-        # Entry
-        self.entry = ttk.Entry(self, width=width, show=show)
-        self.entry.pack(fill="x", pady=(4, 0))
+        tk.Label(
+            label_frame,
+            text=label,
+            bg=Theme.BG_SECONDARY,
+            fg=Theme.TEXT_PRIMARY,
+            font=("Segoe UI", 10),
+            anchor="w"
+        ).pack(anchor="w")
 
-        # Help text
         if help_text:
-            self.help_label = ttk.Label(self, text=help_text, style="Subheader.TLabel")
-            self.help_label.pack(anchor="w", pady=(2, 0))
+            tk.Label(
+                label_frame,
+                text=help_text,
+                bg=Theme.BG_SECONDARY,
+                fg=Theme.TEXT_MUTED,
+                font=("Segoe UI", 9),
+                anchor="w"
+            ).pack(anchor="w")
+
+        # Right side - entry
+        entry_frame = tk.Frame(self, bg=Theme.BG_SECONDARY)
+        entry_frame.pack(side="left", fill="both", expand=True, padx=16, pady=12)
+
+        self.entry = tk.Entry(
+            entry_frame,
+            font=("Segoe UI", 10),
+            bg=Theme.BG_INPUT,
+            fg=Theme.TEXT_PRIMARY,
+            relief="solid",
+            bd=1,
+            highlightthickness=1,
+            highlightcolor=Theme.PRIMARY,
+            highlightbackground=Theme.BORDER,
+            show=show
+        )
+        self.entry.pack(fill="x", ipady=6)
 
     def get(self) -> str:
-        """Get the entry value."""
         return self.entry.get()
 
     def set(self, value: str):
-        """Set the entry value."""
         self.entry.delete(0, tk.END)
         self.entry.insert(0, value)
 
 
-class ToggleCard(ttk.Frame):
-    """A card-style toggle for notification methods."""
+class ToggleSwitch(tk.Frame):
+    """A toggle switch widget."""
 
-    def __init__(
-        self,
-        parent,
-        title: str,
-        description: str,
-        variable: tk.BooleanVar,
-        **kwargs
-    ):
-        super().__init__(parent, **kwargs)
-        self.configure(style="Card.TFrame", padding=12)
+    def __init__(self, parent, text: str, variable: tk.BooleanVar, **kwargs):
+        super().__init__(parent, bg=Theme.BG_SECONDARY, **kwargs)
 
-        # Title and checkbox
-        header = ttk.Frame(self)
-        header.pack(fill="x")
+        self.variable = variable
 
-        self.checkbox = ttk.Checkbutton(
-            header,
-            text=title,
-            variable=variable,
-            style="TCheckbutton"
-        )
-        self.checkbox.pack(side="left")
-
-        # Description
-        desc_label = ttk.Label(
+        # Label
+        tk.Label(
             self,
-            text=description,
-            style="Subheader.TLabel",
-            wraplength=200
+            text=text,
+            bg=Theme.BG_SECONDARY,
+            fg=Theme.TEXT_PRIMARY,
+            font=("Segoe UI", 10),
+            anchor="w"
+        ).pack(side="left", padx=(16, 0), pady=12)
+
+        # Toggle
+        self.canvas = tk.Canvas(
+            self,
+            width=44,
+            height=24,
+            bg=Theme.BG_SECONDARY,
+            highlightthickness=0
         )
-        desc_label.pack(anchor="w", pady=(4, 0))
+        self.canvas.pack(side="right", padx=16, pady=12)
+
+        self._draw()
+        self.canvas.bind("<Button-1>", self._toggle)
+        self.variable.trace_add("write", lambda *args: self._draw())
+
+    def _draw(self):
+        self.canvas.delete("all")
+        if self.variable.get():
+            # On state
+            self.canvas.create_rounded_rect(0, 0, 44, 24, 12, fill=Theme.PRIMARY, outline="")
+            self.canvas.create_oval(22, 2, 42, 22, fill="white", outline="")
+        else:
+            # Off state
+            self.canvas.create_rounded_rect(0, 0, 44, 24, 12, fill=Theme.BORDER, outline="")
+            self.canvas.create_oval(2, 2, 22, 22, fill="white", outline="")
+
+    def _toggle(self, event):
+        self.variable.set(not self.variable.get())
+
+
+# Add rounded rectangle method to Canvas
+def _create_rounded_rect(self, x1, y1, x2, y2, radius, **kwargs):
+    points = [
+        x1 + radius, y1,
+        x2 - radius, y1,
+        x2, y1,
+        x2, y1 + radius,
+        x2, y2 - radius,
+        x2, y2,
+        x2 - radius, y2,
+        x1 + radius, y2,
+        x1, y2,
+        x1, y2 - radius,
+        x1, y1 + radius,
+        x1, y1,
+    ]
+    return self.create_polygon(points, smooth=True, **kwargs)
+
+tk.Canvas.create_rounded_rect = _create_rounded_rect
+
+
+class StatusBadge(tk.Frame):
+    """A status badge showing active/inactive state."""
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, bg=Theme.BG_PRIMARY, **kwargs)
+
+        self.canvas = tk.Canvas(
+            self,
+            width=10,
+            height=10,
+            bg=Theme.BG_PRIMARY,
+            highlightthickness=0
+        )
+        self.canvas.pack(side="left", padx=(0, 8))
+
+        self.label = tk.Label(
+            self,
+            text="Inactive",
+            bg=Theme.BG_PRIMARY,
+            fg=Theme.TEXT_MUTED,
+            font=("Segoe UI", 10)
+        )
+        self.label.pack(side="left")
+
+        self._indicator = self.canvas.create_oval(1, 1, 9, 9, fill=Theme.TEXT_MUTED, outline="")
+
+    def set_active(self, active: bool, text: str = None):
+        color = Theme.SUCCESS if active else Theme.TEXT_MUTED
+        self.canvas.itemconfig(self._indicator, fill=color)
+        self.label.configure(
+            text=text or ("Active" if active else "Inactive"),
+            fg=Theme.SUCCESS if active else Theme.TEXT_MUTED
+        )
 
 
 # =============================================================================
@@ -357,633 +366,591 @@ class EmailMonitorApp:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title(f"E2NB - Email to Notification Blaster v{__version__}")
-        self.root.geometry("900x700")
-        self.root.minsize(800, 600)
-
-        # Set window background
+        self.root.title(f"E2NB - Email to Notification Blaster")
+        self.root.geometry("1000x700")
+        self.root.minsize(900, 600)
         self.root.configure(bg=Theme.BG_PRIMARY)
 
         # Load configuration
         self.config = load_config()
 
-        # State variables
+        # State
         self.monitoring = False
         self.monitor_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
         self.log_queue: queue.Queue = queue.Queue()
+        self.current_page = "email"
+        self.nav_items: Dict[str, SidebarItem] = {}
+        self.pages: Dict[str, tk.Frame] = {}
 
-        # Initialize notification variables
-        self._init_notification_vars()
+        # Initialize variables
+        self._init_variables()
 
-        # Apply styling
-        StyleManager.configure_styles()
-
-        # Create UI
-        self._create_menu()
+        # Build UI
+        self._create_layout()
+        self._create_sidebar()
+        self._create_pages()
         self._create_header()
-        self._create_notebook()
-        self._create_status_bar()
+
+        # Show initial page
+        self._show_page("email")
 
         # Start log processing
         self._process_log_queue()
 
-        # Bind window close event
+        # Handle close
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _init_notification_vars(self):
-        """Initialize boolean variables for notification toggles."""
-        self.twilio_sms_var = tk.BooleanVar(
-            value=self.config.getboolean('Twilio', 'enabled', fallback=False)
-        )
-        self.voice_var = tk.BooleanVar(
-            value=self.config.getboolean('Voice', 'enabled', fallback=False)
-        )
-        self.whatsapp_var = tk.BooleanVar(
-            value=self.config.getboolean('WhatsApp', 'enabled', fallback=False)
-        )
-        self.slack_var = tk.BooleanVar(
-            value=self.config.getboolean('Slack', 'enabled', fallback=False)
-        )
-        self.telegram_var = tk.BooleanVar(
-            value=self.config.getboolean('Telegram', 'enabled', fallback=False)
-        )
-        self.discord_var = tk.BooleanVar(
-            value=self.config.getboolean('Discord', 'enabled', fallback=False)
-        )
-        self.custom_webhook_var = tk.BooleanVar(
-            value=self.config.getboolean('CustomWebhook', 'enabled', fallback=False)
-        )
-
-    def _create_menu(self):
-        """Create the application menu bar."""
-        menubar = tk.Menu(self.root)
-        self.root.config(menu=menubar)
-
-        # File menu
-        file_menu = tk.Menu(menubar, tearoff=False)
-        menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(label="Save Settings", command=self._save_settings)
-        file_menu.add_command(label="Reload Settings", command=self._reload_settings)
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self._on_close)
-
-        # Tools menu
-        tools_menu = tk.Menu(menubar, tearoff=False)
-        menubar.add_cascade(label="Tools", menu=tools_menu)
-        tools_menu.add_command(label="Test Email Connection", command=self._test_email_connection)
-        tools_menu.add_command(label="Clear Logs", command=self._clear_logs)
-
-        # Help menu
-        help_menu = tk.Menu(menubar, tearoff=False)
-        menubar.add_cascade(label="Help", menu=help_menu)
-        help_menu.add_command(label="Documentation", command=self._show_docs)
-        help_menu.add_separator()
-        help_menu.add_command(label="About", command=self._show_about)
-
-    def _create_header(self):
-        """Create the application header with status and controls."""
-        header_frame = ttk.Frame(self.root, padding="16 16 16 8")
-        header_frame.pack(fill="x")
-
-        # Left side - Title and status
-        left_frame = ttk.Frame(header_frame)
-        left_frame.pack(side="left", fill="y")
-
-        title_label = ttk.Label(
-            left_frame,
-            text="Email Monitor",
-            style="Header.TLabel"
-        )
-        title_label.pack(anchor="w")
-
-        self.status_indicator = StatusIndicator(left_frame)
-        self.status_indicator.pack(anchor="w", pady=(4, 0))
-
-        # Right side - Control buttons
-        right_frame = ttk.Frame(header_frame)
-        right_frame.pack(side="right")
-
-        self.start_button = ttk.Button(
-            right_frame,
-            text="Start Monitoring",
-            command=self._start_monitoring,
-            style="Success.TButton"
-        )
-        self.start_button.pack(side="left", padx=(0, 8))
-
-        self.stop_button = ttk.Button(
-            right_frame,
-            text="Stop Monitoring",
-            command=self._stop_monitoring,
-            style="Danger.TButton",
-            state="disabled"
-        )
-        self.stop_button.pack(side="left", padx=(0, 8))
-
-        self.save_button = ttk.Button(
-            right_frame,
-            text="Save Settings",
-            command=self._save_settings,
-            style="Primary.TButton"
-        )
-        self.save_button.pack(side="left")
-
-    def _create_notebook(self):
-        """Create the main tabbed interface."""
-        self.notebook = ttk.Notebook(self.root, padding=8)
-        self.notebook.pack(fill="both", expand=True, padx=16, pady=8)
-
-        # Create tabs
-        self._create_email_tab()
-        self._create_settings_tab()
-        self._create_notifications_tab()
-        self._create_twilio_sms_tab()
-        self._create_twilio_voice_tab()
-        self._create_twilio_whatsapp_tab()
-        self._create_slack_tab()
-        self._create_telegram_tab()
-        self._create_discord_tab()
-        self._create_webhook_tab()
-        self._create_logs_tab()
-
-    def _create_email_tab(self):
-        """Create the Email Settings tab."""
-        frame = ttk.Frame(self.notebook, padding=16)
-        self.notebook.add(frame, text="Email Settings")
-
-        # IMAP Server settings
-        server_frame = ttk.LabelFrame(frame, text="IMAP Server Configuration", padding=12)
-        server_frame.pack(fill="x", pady=(0, 16))
-
-        grid_frame = ttk.Frame(server_frame)
-        grid_frame.pack(fill="x")
-
-        # Server
-        ttk.Label(grid_frame, text="IMAP Server:").grid(row=0, column=0, sticky="w", pady=4)
-        self.imap_server_entry = ttk.Entry(grid_frame, width=40)
-        self.imap_server_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=4)
-        self.imap_server_entry.insert(0, self.config.get('Email', 'imap_server', fallback='imap.gmail.com'))
-
-        # Port
-        ttk.Label(grid_frame, text="Port:").grid(row=1, column=0, sticky="w", pady=4)
-        self.imap_port_entry = ttk.Entry(grid_frame, width=10)
-        self.imap_port_entry.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=4)
-        self.imap_port_entry.insert(0, self.config.get('Email', 'imap_port', fallback=str(DEFAULT_IMAP_PORT)))
-
-        # Test connection button
-        test_btn = ttk.Button(grid_frame, text="Test Connection", command=self._test_email_connection)
-        test_btn.grid(row=1, column=2, padx=(16, 0), pady=4)
-
-        grid_frame.columnconfigure(1, weight=1)
-
-        # Credentials
-        creds_frame = ttk.LabelFrame(frame, text="Email Credentials", padding=12)
-        creds_frame.pack(fill="x", pady=(0, 16))
-
-        creds_grid = ttk.Frame(creds_frame)
-        creds_grid.pack(fill="x")
-
-        ttk.Label(creds_grid, text="Username (Email):").grid(row=0, column=0, sticky="w", pady=4)
-        self.username_entry = ttk.Entry(creds_grid, width=40)
-        self.username_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=4)
-        self.username_entry.insert(0, self.config.get('Email', 'username', fallback=''))
-
-        ttk.Label(creds_grid, text="Password:").grid(row=1, column=0, sticky="w", pady=4)
-        self.password_entry = ttk.Entry(creds_grid, width=40, show="*")
-        self.password_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=4)
-        self.password_entry.insert(0, self.config.get('Email', 'password', fallback=''))
-
-        # Show/hide password toggle
+    def _init_variables(self):
+        """Initialize tkinter variables."""
+        self.twilio_sms_var = tk.BooleanVar(value=self.config.getboolean('Twilio', 'enabled', fallback=False))
+        self.voice_var = tk.BooleanVar(value=self.config.getboolean('Voice', 'enabled', fallback=False))
+        self.whatsapp_var = tk.BooleanVar(value=self.config.getboolean('WhatsApp', 'enabled', fallback=False))
+        self.slack_var = tk.BooleanVar(value=self.config.getboolean('Slack', 'enabled', fallback=False))
+        self.telegram_var = tk.BooleanVar(value=self.config.getboolean('Telegram', 'enabled', fallback=False))
+        self.discord_var = tk.BooleanVar(value=self.config.getboolean('Discord', 'enabled', fallback=False))
+        self.webhook_var = tk.BooleanVar(value=self.config.getboolean('CustomWebhook', 'enabled', fallback=False))
+        self.auto_scroll_var = tk.BooleanVar(value=True)
         self.show_password_var = tk.BooleanVar(value=False)
-        show_pass_cb = ttk.Checkbutton(
-            creds_grid,
-            text="Show",
-            variable=self.show_password_var,
-            command=self._toggle_password_visibility
-        )
-        show_pass_cb.grid(row=1, column=2, padx=(8, 0), pady=4)
 
-        creds_grid.columnconfigure(1, weight=1)
+    def _create_layout(self):
+        """Create the main layout structure."""
+        # Sidebar
+        self.sidebar = tk.Frame(self.root, bg=Theme.SIDEBAR_BG, width=220)
+        self.sidebar.pack(side="left", fill="y")
+        self.sidebar.pack_propagate(False)
 
-        # Note about app passwords
-        note_label = ttk.Label(
-            creds_frame,
-            text="Note: For Gmail, use an App Password if 2FA is enabled.",
-            style="Subheader.TLabel"
-        )
-        note_label.pack(anchor="w", pady=(8, 0))
+        # Main content area
+        self.main_area = tk.Frame(self.root, bg=Theme.BG_PRIMARY)
+        self.main_area.pack(side="left", fill="both", expand=True)
 
-        # Email Filtering
-        filter_frame = ttk.LabelFrame(frame, text="Email Filtering (Optional)", padding=12)
-        filter_frame.pack(fill="x")
+        # Header in main area
+        self.header = tk.Frame(self.main_area, bg=Theme.BG_PRIMARY, height=70)
+        self.header.pack(fill="x")
+        self.header.pack_propagate(False)
 
-        ttk.Label(
-            filter_frame,
-            text="Filter emails from specific senders or domains:"
+        # Content container
+        self.content = tk.Frame(self.main_area, bg=Theme.BG_PRIMARY)
+        self.content.pack(fill="both", expand=True, padx=32, pady=(0, 32))
+
+    def _create_sidebar(self):
+        """Create the sidebar navigation."""
+        # Logo/Title
+        title_frame = tk.Frame(self.sidebar, bg=Theme.SIDEBAR_BG)
+        title_frame.pack(fill="x", pady=20)
+
+        tk.Label(
+            title_frame,
+            text="E2NB",
+            bg=Theme.SIDEBAR_BG,
+            fg="#ffffff",
+            font=("Segoe UI", 16, "bold"),
+            padx=16
         ).pack(anchor="w")
 
-        self.filter_emails_entry = ttk.Entry(filter_frame, width=60)
-        self.filter_emails_entry.pack(fill="x", pady=(4, 0))
-        self.filter_emails_entry.insert(0, self.config.get('Email', 'filter_emails', fallback=''))
+        tk.Label(
+            title_frame,
+            text=f"v{__version__}",
+            bg=Theme.SIDEBAR_BG,
+            fg=Theme.SIDEBAR_SECTION,
+            font=("Segoe UI", 9),
+            padx=16
+        ).pack(anchor="w")
 
-        ttk.Label(
-            filter_frame,
-            text="Examples: user@example.com, @company.com (comma-separated)",
-            style="Subheader.TLabel"
-        ).pack(anchor="w", pady=(4, 0))
+        # Navigation sections
+        SidebarSection(self.sidebar, "Configuration").pack(fill="x")
 
-    def _create_settings_tab(self):
-        """Create the General Settings tab."""
-        frame = ttk.Frame(self.notebook, padding=16)
-        self.notebook.add(frame, text="Settings")
-
-        settings_frame = ttk.LabelFrame(frame, text="General Settings", padding=12)
-        settings_frame.pack(fill="x")
-
-        grid_frame = ttk.Frame(settings_frame)
-        grid_frame.pack(fill="x")
-
-        # Check interval
-        ttk.Label(grid_frame, text="Check Interval (seconds):").grid(row=0, column=0, sticky="w", pady=4)
-        self.check_interval_entry = ttk.Entry(grid_frame, width=10)
-        self.check_interval_entry.grid(row=0, column=1, sticky="w", padx=(8, 0), pady=4)
-        self.check_interval_entry.insert(0, self.config.get('Settings', 'check_interval', fallback=str(DEFAULT_CHECK_INTERVAL)))
-
-        ttk.Label(
-            grid_frame,
-            text="How often to check for new emails",
-            style="Subheader.TLabel"
-        ).grid(row=0, column=2, sticky="w", padx=(16, 0), pady=4)
-
-        # Max SMS length
-        ttk.Label(grid_frame, text="Max SMS Length:").grid(row=1, column=0, sticky="w", pady=4)
-        self.max_sms_length_entry = ttk.Entry(grid_frame, width=10)
-        self.max_sms_length_entry.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=4)
-        self.max_sms_length_entry.insert(0, self.config.get('Settings', 'max_sms_length', fallback=str(DEFAULT_MAX_SMS_LENGTH)))
-
-        ttk.Label(
-            grid_frame,
-            text="Maximum characters for SMS messages",
-            style="Subheader.TLabel"
-        ).grid(row=1, column=2, sticky="w", padx=(16, 0), pady=4)
-
-    def _create_notifications_tab(self):
-        """Create the Notification Methods overview tab."""
-        frame = ttk.Frame(self.notebook, padding=16)
-        self.notebook.add(frame, text="Notifications")
-
-        ttk.Label(
-            frame,
-            text="Enable/disable notification channels:",
-            style="Header.TLabel"
-        ).pack(anchor="w", pady=(0, 16))
-
-        # Grid of toggle cards
-        grid_frame = ttk.Frame(frame)
-        grid_frame.pack(fill="both", expand=True)
-
-        notifications = [
-            ("SMS (Twilio)", "Send text messages to phone numbers", self.twilio_sms_var),
-            ("Voice Call (Twilio)", "Make voice calls with text-to-speech", self.voice_var),
-            ("WhatsApp (Twilio)", "Send WhatsApp messages", self.whatsapp_var),
-            ("Slack", "Post to Slack channels", self.slack_var),
-            ("Telegram", "Send Telegram bot messages", self.telegram_var),
-            ("Discord", "Post to Discord via webhooks", self.discord_var),
-            ("Custom Webhook", "Send to any HTTP endpoint", self.custom_webhook_var),
+        nav_items = [
+            ("email", "Email Settings", 0),
+            ("settings", "General", 0),
         ]
 
-        for i, (title, desc, var) in enumerate(notifications):
-            row = i // 2
-            col = i % 2
+        for key, text, indent in nav_items:
+            item = SidebarItem(self.sidebar, text, lambda k=key: self._show_page(k), indent)
+            item.pack(fill="x")
+            self.nav_items[key] = item
 
-            card = ToggleCard(grid_frame, title, desc, var)
-            card.grid(row=row, column=col, sticky="nsew", padx=4, pady=4)
+        SidebarSection(self.sidebar, "Notifications").pack(fill="x")
 
-        grid_frame.columnconfigure(0, weight=1)
-        grid_frame.columnconfigure(1, weight=1)
+        notification_items = [
+            ("sms", "Twilio SMS", 0),
+            ("voice", "Twilio Voice", 0),
+            ("whatsapp", "WhatsApp", 0),
+            ("slack", "Slack", 0),
+            ("telegram", "Telegram", 0),
+            ("discord", "Discord", 0),
+            ("webhook", "Webhook", 0),
+        ]
 
-    def _create_twilio_sms_tab(self):
-        """Create the Twilio SMS configuration tab."""
-        frame = ttk.Frame(self.notebook, padding=16)
-        self.notebook.add(frame, text="Twilio SMS")
+        for key, text, indent in notification_items:
+            item = SidebarItem(self.sidebar, text, lambda k=key: self._show_page(k), indent)
+            item.pack(fill="x")
+            self.nav_items[key] = item
 
-        config_frame = ttk.LabelFrame(frame, text="Twilio SMS Configuration", padding=12)
-        config_frame.pack(fill="x")
+        SidebarSection(self.sidebar, "Monitor").pack(fill="x")
 
-        grid_frame = ttk.Frame(config_frame)
-        grid_frame.pack(fill="x")
+        item = SidebarItem(self.sidebar, "Logs", lambda: self._show_page("logs"), 0)
+        item.pack(fill="x")
+        self.nav_items["logs"] = item
 
-        # Account SID
-        ttk.Label(grid_frame, text="Account SID:").grid(row=0, column=0, sticky="w", pady=4)
-        self.twilio_sms_sid_entry = ttk.Entry(grid_frame, width=50)
-        self.twilio_sms_sid_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=4)
-        self.twilio_sms_sid_entry.insert(0, self.config.get('Twilio', 'account_sid', fallback=''))
+    def _create_header(self):
+        """Create the header with status and controls."""
+        # Left side - status
+        left = tk.Frame(self.header, bg=Theme.BG_PRIMARY)
+        left.pack(side="left", padx=32, pady=16)
 
-        # Auth Token
-        ttk.Label(grid_frame, text="Auth Token:").grid(row=1, column=0, sticky="w", pady=4)
-        self.twilio_sms_token_entry = ttk.Entry(grid_frame, width=50, show="*")
-        self.twilio_sms_token_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=4)
-        self.twilio_sms_token_entry.insert(0, self.config.get('Twilio', 'auth_token', fallback=''))
+        self.page_title = tk.Label(
+            left,
+            text="Email Settings",
+            bg=Theme.BG_PRIMARY,
+            fg=Theme.TEXT_PRIMARY,
+            font=("Segoe UI", 14, "bold")
+        )
+        self.page_title.pack(anchor="w")
 
-        # From Number
-        ttk.Label(grid_frame, text="From Number:").grid(row=2, column=0, sticky="w", pady=4)
-        self.twilio_sms_from_entry = ttk.Entry(grid_frame, width=30)
-        self.twilio_sms_from_entry.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=4)
-        self.twilio_sms_from_entry.insert(0, self.config.get('Twilio', 'from_number', fallback=''))
+        self.status_badge = StatusBadge(left)
+        self.status_badge.pack(anchor="w", pady=(4, 0))
 
-        # Destination Numbers
-        ttk.Label(grid_frame, text="Destination Number(s):").grid(row=3, column=0, sticky="w", pady=4)
-        self.twilio_sms_to_entry = ttk.Entry(grid_frame, width=50)
-        self.twilio_sms_to_entry.grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=4)
-        self.twilio_sms_to_entry.insert(0, self.config.get('Twilio', 'destination_number', fallback=''))
+        # Right side - buttons
+        right = tk.Frame(self.header, bg=Theme.BG_PRIMARY)
+        right.pack(side="right", padx=32, pady=16)
 
-        ttk.Label(
-            grid_frame,
-            text="Separate multiple numbers with commas (e.g., +1234567890, +0987654321)",
-            style="Subheader.TLabel"
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.stop_btn = tk.Button(
+            right,
+            text="Stop",
+            command=self._stop_monitoring,
+            bg=Theme.ERROR,
+            fg="white",
+            font=("Segoe UI", 10),
+            relief="flat",
+            padx=16,
+            pady=6,
+            cursor="hand2",
+            state="disabled"
+        )
+        self.stop_btn.pack(side="right", padx=(8, 0))
 
-        grid_frame.columnconfigure(1, weight=1)
+        self.start_btn = tk.Button(
+            right,
+            text="Start Monitoring",
+            command=self._start_monitoring,
+            bg=Theme.SUCCESS,
+            fg="white",
+            font=("Segoe UI", 10, "bold"),
+            relief="flat",
+            padx=16,
+            pady=6,
+            cursor="hand2"
+        )
+        self.start_btn.pack(side="right", padx=(8, 0))
 
-    def _create_twilio_voice_tab(self):
-        """Create the Twilio Voice configuration tab."""
-        frame = ttk.Frame(self.notebook, padding=16)
-        self.notebook.add(frame, text="Twilio Voice")
+        self.save_btn = tk.Button(
+            right,
+            text="Save",
+            command=self._save_settings,
+            bg=Theme.PRIMARY,
+            fg="white",
+            font=("Segoe UI", 10),
+            relief="flat",
+            padx=16,
+            pady=6,
+            cursor="hand2"
+        )
+        self.save_btn.pack(side="right")
 
-        config_frame = ttk.LabelFrame(frame, text="Twilio Voice Call Configuration", padding=12)
-        config_frame.pack(fill="x")
+    def _create_pages(self):
+        """Create all content pages."""
+        self._create_email_page()
+        self._create_settings_page()
+        self._create_sms_page()
+        self._create_voice_page()
+        self._create_whatsapp_page()
+        self._create_slack_page()
+        self._create_telegram_page()
+        self._create_discord_page()
+        self._create_webhook_page()
+        self._create_logs_page()
 
-        grid_frame = ttk.Frame(config_frame)
-        grid_frame.pack(fill="x")
+    def _create_scrollable_page(self, name: str) -> tk.Frame:
+        """Create a scrollable page container."""
+        container = tk.Frame(self.content, bg=Theme.BG_PRIMARY)
 
-        # Account SID
-        ttk.Label(grid_frame, text="Account SID:").grid(row=0, column=0, sticky="w", pady=4)
-        self.twilio_voice_sid_entry = ttk.Entry(grid_frame, width=50)
-        self.twilio_voice_sid_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=4)
-        self.twilio_voice_sid_entry.insert(0, self.config.get('Voice', 'account_sid', fallback=''))
+        canvas = tk.Canvas(container, bg=Theme.BG_PRIMARY, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        scrollable = tk.Frame(canvas, bg=Theme.BG_PRIMARY)
 
-        # Auth Token
-        ttk.Label(grid_frame, text="Auth Token:").grid(row=1, column=0, sticky="w", pady=4)
-        self.twilio_voice_token_entry = ttk.Entry(grid_frame, width=50, show="*")
-        self.twilio_voice_token_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=4)
-        self.twilio_voice_token_entry.insert(0, self.config.get('Voice', 'auth_token', fallback=''))
+        scrollable.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
 
-        # From Number
-        ttk.Label(grid_frame, text="From Number:").grid(row=2, column=0, sticky="w", pady=4)
-        self.twilio_voice_from_entry = ttk.Entry(grid_frame, width=30)
-        self.twilio_voice_from_entry.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=4)
-        self.twilio_voice_from_entry.insert(0, self.config.get('Voice', 'from_number', fallback=''))
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
 
-        # Destination Numbers
-        ttk.Label(grid_frame, text="Destination Number(s):").grid(row=3, column=0, sticky="w", pady=4)
-        self.twilio_voice_to_entry = ttk.Entry(grid_frame, width=50)
-        self.twilio_voice_to_entry.grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=4)
-        self.twilio_voice_to_entry.insert(0, self.config.get('Voice', 'destination_number', fallback=''))
+        # Mouse wheel scrolling
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-        ttk.Label(
-            grid_frame,
-            text="Separate multiple numbers with commas",
-            style="Subheader.TLabel"
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
-        grid_frame.columnconfigure(1, weight=1)
+        self.pages[name] = container
+        return scrollable
 
-    def _create_twilio_whatsapp_tab(self):
-        """Create the Twilio WhatsApp configuration tab."""
-        frame = ttk.Frame(self.notebook, padding=16)
-        self.notebook.add(frame, text="WhatsApp")
+    def _create_email_page(self):
+        """Create the email settings page."""
+        page = self._create_scrollable_page("email")
 
-        config_frame = ttk.LabelFrame(frame, text="Twilio WhatsApp Configuration", padding=12)
-        config_frame.pack(fill="x")
+        # IMAP Settings
+        section = FormSection(page, "IMAP Server")
+        section.pack(fill="x", pady=(0, 24))
 
-        grid_frame = ttk.Frame(config_frame)
-        grid_frame.pack(fill="x")
+        self.imap_server = FormRow(section.content, "Server", "e.g., imap.gmail.com")
+        self.imap_server.pack(fill="x")
+        self.imap_server.set(self.config.get('Email', 'imap_server', fallback='imap.gmail.com'))
 
-        # Account SID
-        ttk.Label(grid_frame, text="Account SID:").grid(row=0, column=0, sticky="w", pady=4)
-        self.twilio_whatsapp_sid_entry = ttk.Entry(grid_frame, width=50)
-        self.twilio_whatsapp_sid_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=4)
-        self.twilio_whatsapp_sid_entry.insert(0, self.config.get('WhatsApp', 'account_sid', fallback=''))
+        sep = tk.Frame(section.content, bg=Theme.BORDER, height=1)
+        sep.pack(fill="x")
 
-        # Auth Token
-        ttk.Label(grid_frame, text="Auth Token:").grid(row=1, column=0, sticky="w", pady=4)
-        self.twilio_whatsapp_token_entry = ttk.Entry(grid_frame, width=50, show="*")
-        self.twilio_whatsapp_token_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=4)
-        self.twilio_whatsapp_token_entry.insert(0, self.config.get('WhatsApp', 'auth_token', fallback=''))
+        self.imap_port = FormRow(section.content, "Port", "Usually 993 for SSL")
+        self.imap_port.pack(fill="x")
+        self.imap_port.set(self.config.get('Email', 'imap_port', fallback='993'))
 
-        # From Number
-        ttk.Label(grid_frame, text="From Number:").grid(row=2, column=0, sticky="w", pady=4)
-        self.twilio_whatsapp_from_entry = ttk.Entry(grid_frame, width=40)
-        self.twilio_whatsapp_from_entry.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=4)
-        self.twilio_whatsapp_from_entry.insert(0, self.config.get('WhatsApp', 'from_number', fallback=''))
+        # Credentials
+        section2 = FormSection(page, "Credentials")
+        section2.pack(fill="x", pady=(0, 24))
 
-        ttk.Label(
-            grid_frame,
-            text="Format: whatsapp:+1234567890",
-            style="Subheader.TLabel"
-        ).grid(row=2, column=2, sticky="w", padx=(8, 0), pady=4)
+        self.username = FormRow(section2.content, "Email", "Your email address")
+        self.username.pack(fill="x")
+        self.username.set(self.config.get('Email', 'username', fallback=''))
 
-        # To Numbers
-        ttk.Label(grid_frame, text="To Number(s):").grid(row=3, column=0, sticky="w", pady=4)
-        self.twilio_whatsapp_to_entry = ttk.Entry(grid_frame, width=50)
-        self.twilio_whatsapp_to_entry.grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=4)
-        self.twilio_whatsapp_to_entry.insert(0, self.config.get('WhatsApp', 'to_number', fallback=''))
+        sep = tk.Frame(section2.content, bg=Theme.BORDER, height=1)
+        sep.pack(fill="x")
 
-        ttk.Label(
-            grid_frame,
-            text="Separate multiple with commas (e.g., whatsapp:+1234567890, whatsapp:+0987654321)",
-            style="Subheader.TLabel"
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.password = FormRow(section2.content, "Password", "App password if 2FA enabled", show="*")
+        self.password.pack(fill="x")
+        self.password.set(self.config.get('Email', 'password', fallback=''))
 
-        grid_frame.columnconfigure(1, weight=1)
+        # Test button
+        btn_frame = tk.Frame(page, bg=Theme.BG_PRIMARY)
+        btn_frame.pack(fill="x", pady=(0, 24))
 
-    def _create_slack_tab(self):
-        """Create the Slack configuration tab."""
-        frame = ttk.Frame(self.notebook, padding=16)
-        self.notebook.add(frame, text="Slack")
+        tk.Button(
+            btn_frame,
+            text="Test Connection",
+            command=self._test_connection,
+            bg=Theme.BG_SECONDARY,
+            fg=Theme.TEXT_PRIMARY,
+            font=("Segoe UI", 10),
+            relief="solid",
+            bd=1,
+            padx=16,
+            pady=6,
+            cursor="hand2"
+        ).pack(side="left")
 
-        config_frame = ttk.LabelFrame(frame, text="Slack Configuration", padding=12)
-        config_frame.pack(fill="x")
+        # Filters
+        section3 = FormSection(page, "Email Filters (Optional)")
+        section3.pack(fill="x")
 
-        grid_frame = ttk.Frame(config_frame)
-        grid_frame.pack(fill="x")
+        self.filters = FormRow(section3.content, "Filter", "Comma-separated addresses or @domains")
+        self.filters.pack(fill="x")
+        self.filters.set(self.config.get('Email', 'filter_emails', fallback=''))
 
-        # Token
-        ttk.Label(grid_frame, text="Bot Token:").grid(row=0, column=0, sticky="w", pady=4)
-        self.slack_token_entry = ttk.Entry(grid_frame, width=60, show="*")
-        self.slack_token_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=4)
-        self.slack_token_entry.insert(0, self.config.get('Slack', 'token', fallback=''))
+    def _create_settings_page(self):
+        """Create the general settings page."""
+        page = self._create_scrollable_page("settings")
 
-        ttk.Label(
-            grid_frame,
-            text="Starts with xoxb-",
-            style="Subheader.TLabel"
-        ).grid(row=0, column=2, sticky="w", padx=(8, 0), pady=4)
+        section = FormSection(page, "Monitoring Settings")
+        section.pack(fill="x", pady=(0, 24))
 
-        # Channel
-        ttk.Label(grid_frame, text="Channel:").grid(row=1, column=0, sticky="w", pady=4)
-        self.slack_channel_entry = ttk.Entry(grid_frame, width=30)
-        self.slack_channel_entry.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=4)
-        self.slack_channel_entry.insert(0, self.config.get('Slack', 'channel', fallback=''))
+        self.check_interval = FormRow(section.content, "Check Interval", "Seconds between checks")
+        self.check_interval.pack(fill="x")
+        self.check_interval.set(self.config.get('Settings', 'check_interval', fallback='60'))
 
-        ttk.Label(
-            grid_frame,
-            text="e.g., #notifications or notifications",
-            style="Subheader.TLabel"
-        ).grid(row=1, column=2, sticky="w", padx=(8, 0), pady=4)
+        sep = tk.Frame(section.content, bg=Theme.BORDER, height=1)
+        sep.pack(fill="x")
 
-        grid_frame.columnconfigure(1, weight=1)
+        self.max_sms = FormRow(section.content, "Max SMS Length", "Character limit for SMS")
+        self.max_sms.pack(fill="x")
+        self.max_sms.set(self.config.get('Settings', 'max_sms_length', fallback='1600'))
 
-    def _create_telegram_tab(self):
-        """Create the Telegram configuration tab."""
-        frame = ttk.Frame(self.notebook, padding=16)
-        self.notebook.add(frame, text="Telegram")
+    def _create_sms_page(self):
+        """Create the Twilio SMS page."""
+        page = self._create_scrollable_page("sms")
 
-        config_frame = ttk.LabelFrame(frame, text="Telegram Bot Configuration", padding=12)
-        config_frame.pack(fill="x")
+        # Enable toggle
+        toggle_frame = tk.Frame(page, bg=Theme.BG_SECONDARY, highlightbackground=Theme.BORDER, highlightthickness=1)
+        toggle_frame.pack(fill="x", pady=(0, 24))
+        ToggleSwitch(toggle_frame, "Enable SMS Notifications", self.twilio_sms_var).pack(fill="x")
 
-        grid_frame = ttk.Frame(config_frame)
-        grid_frame.pack(fill="x")
+        section = FormSection(page, "Twilio Credentials")
+        section.pack(fill="x", pady=(0, 24))
 
-        # Bot Token
-        ttk.Label(grid_frame, text="Bot Token:").grid(row=0, column=0, sticky="w", pady=4)
-        self.telegram_bot_token_entry = ttk.Entry(grid_frame, width=60, show="*")
-        self.telegram_bot_token_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=4)
-        self.telegram_bot_token_entry.insert(0, self.config.get('Telegram', 'bot_token', fallback=''))
+        self.sms_sid = FormRow(section.content, "Account SID", "From Twilio Console")
+        self.sms_sid.pack(fill="x")
+        self.sms_sid.set(self.config.get('Twilio', 'account_sid', fallback=''))
 
-        # Chat ID
-        ttk.Label(grid_frame, text="Chat ID:").grid(row=1, column=0, sticky="w", pady=4)
-        self.telegram_chat_id_entry = ttk.Entry(grid_frame, width=30)
-        self.telegram_chat_id_entry.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=4)
-        self.telegram_chat_id_entry.insert(0, self.config.get('Telegram', 'chat_id', fallback=''))
+        sep = tk.Frame(section.content, bg=Theme.BORDER, height=1)
+        sep.pack(fill="x")
 
-        ttk.Label(
-            grid_frame,
-            text="Use @userinfobot to get your Chat ID",
-            style="Subheader.TLabel"
-        ).grid(row=1, column=2, sticky="w", padx=(8, 0), pady=4)
+        self.sms_token = FormRow(section.content, "Auth Token", "From Twilio Console", show="*")
+        self.sms_token.pack(fill="x")
+        self.sms_token.set(self.config.get('Twilio', 'auth_token', fallback=''))
 
-        grid_frame.columnconfigure(1, weight=1)
+        section2 = FormSection(page, "Phone Numbers")
+        section2.pack(fill="x")
 
-    def _create_discord_tab(self):
-        """Create the Discord configuration tab."""
-        frame = ttk.Frame(self.notebook, padding=16)
-        self.notebook.add(frame, text="Discord")
+        self.sms_from = FormRow(section2.content, "From Number", "Your Twilio number")
+        self.sms_from.pack(fill="x")
+        self.sms_from.set(self.config.get('Twilio', 'from_number', fallback=''))
 
-        config_frame = ttk.LabelFrame(frame, text="Discord Webhook Configuration", padding=12)
-        config_frame.pack(fill="x")
+        sep = tk.Frame(section2.content, bg=Theme.BORDER, height=1)
+        sep.pack(fill="x")
 
-        grid_frame = ttk.Frame(config_frame)
-        grid_frame.pack(fill="x")
+        self.sms_to = FormRow(section2.content, "To Number(s)", "Comma-separated")
+        self.sms_to.pack(fill="x")
+        self.sms_to.set(self.config.get('Twilio', 'destination_number', fallback=''))
 
-        # Webhook URL
-        ttk.Label(grid_frame, text="Webhook URL:").grid(row=0, column=0, sticky="w", pady=4)
-        self.discord_webhook_entry = ttk.Entry(grid_frame, width=80)
-        self.discord_webhook_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=4)
-        self.discord_webhook_entry.insert(0, self.config.get('Discord', 'webhook_url', fallback=''))
+    def _create_voice_page(self):
+        """Create the Twilio Voice page."""
+        page = self._create_scrollable_page("voice")
 
-        ttk.Label(
-            grid_frame,
-            text="Get this from Channel Settings > Integrations > Webhooks",
-            style="Subheader.TLabel"
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        toggle_frame = tk.Frame(page, bg=Theme.BG_SECONDARY, highlightbackground=Theme.BORDER, highlightthickness=1)
+        toggle_frame.pack(fill="x", pady=(0, 24))
+        ToggleSwitch(toggle_frame, "Enable Voice Calls", self.voice_var).pack(fill="x")
 
-        grid_frame.columnconfigure(1, weight=1)
+        section = FormSection(page, "Twilio Credentials")
+        section.pack(fill="x", pady=(0, 24))
 
-    def _create_webhook_tab(self):
-        """Create the Custom Webhook configuration tab."""
-        frame = ttk.Frame(self.notebook, padding=16)
-        self.notebook.add(frame, text="Webhook")
+        self.voice_sid = FormRow(section.content, "Account SID", "From Twilio Console")
+        self.voice_sid.pack(fill="x")
+        self.voice_sid.set(self.config.get('Voice', 'account_sid', fallback=''))
 
-        config_frame = ttk.LabelFrame(frame, text="Custom Webhook Configuration", padding=12)
-        config_frame.pack(fill="x")
+        sep = tk.Frame(section.content, bg=Theme.BORDER, height=1)
+        sep.pack(fill="x")
 
-        grid_frame = ttk.Frame(config_frame)
-        grid_frame.pack(fill="x")
+        self.voice_token = FormRow(section.content, "Auth Token", "From Twilio Console", show="*")
+        self.voice_token.pack(fill="x")
+        self.voice_token.set(self.config.get('Voice', 'auth_token', fallback=''))
 
-        # Webhook URL
-        ttk.Label(grid_frame, text="Webhook URL:").grid(row=0, column=0, sticky="w", pady=4)
-        self.custom_webhook_entry = ttk.Entry(grid_frame, width=80)
-        self.custom_webhook_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=4)
-        self.custom_webhook_entry.insert(0, self.config.get('CustomWebhook', 'webhook_url', fallback=''))
+        section2 = FormSection(page, "Phone Numbers")
+        section2.pack(fill="x")
 
-        ttk.Label(
-            grid_frame,
-            text="Sends JSON payload: {subject, body, sender, timestamp}",
-            style="Subheader.TLabel"
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.voice_from = FormRow(section2.content, "From Number", "Your Twilio number")
+        self.voice_from.pack(fill="x")
+        self.voice_from.set(self.config.get('Voice', 'from_number', fallback=''))
 
-        grid_frame.columnconfigure(1, weight=1)
+        sep = tk.Frame(section2.content, bg=Theme.BORDER, height=1)
+        sep.pack(fill="x")
 
-    def _create_logs_tab(self):
-        """Create the Logs tab."""
-        frame = ttk.Frame(self.notebook, padding=16)
-        self.notebook.add(frame, text="Logs")
+        self.voice_to = FormRow(section2.content, "To Number(s)", "Comma-separated")
+        self.voice_to.pack(fill="x")
+        self.voice_to.set(self.config.get('Voice', 'destination_number', fallback=''))
+
+    def _create_whatsapp_page(self):
+        """Create the WhatsApp page."""
+        page = self._create_scrollable_page("whatsapp")
+
+        toggle_frame = tk.Frame(page, bg=Theme.BG_SECONDARY, highlightbackground=Theme.BORDER, highlightthickness=1)
+        toggle_frame.pack(fill="x", pady=(0, 24))
+        ToggleSwitch(toggle_frame, "Enable WhatsApp", self.whatsapp_var).pack(fill="x")
+
+        section = FormSection(page, "Twilio Credentials")
+        section.pack(fill="x", pady=(0, 24))
+
+        self.wa_sid = FormRow(section.content, "Account SID", "From Twilio Console")
+        self.wa_sid.pack(fill="x")
+        self.wa_sid.set(self.config.get('WhatsApp', 'account_sid', fallback=''))
+
+        sep = tk.Frame(section.content, bg=Theme.BORDER, height=1)
+        sep.pack(fill="x")
+
+        self.wa_token = FormRow(section.content, "Auth Token", "From Twilio Console", show="*")
+        self.wa_token.pack(fill="x")
+        self.wa_token.set(self.config.get('WhatsApp', 'auth_token', fallback=''))
+
+        section2 = FormSection(page, "WhatsApp Numbers")
+        section2.pack(fill="x")
+
+        self.wa_from = FormRow(section2.content, "From", "e.g., whatsapp:+14155238886")
+        self.wa_from.pack(fill="x")
+        self.wa_from.set(self.config.get('WhatsApp', 'from_number', fallback=''))
+
+        sep = tk.Frame(section2.content, bg=Theme.BORDER, height=1)
+        sep.pack(fill="x")
+
+        self.wa_to = FormRow(section2.content, "To", "e.g., whatsapp:+1234567890")
+        self.wa_to.pack(fill="x")
+        self.wa_to.set(self.config.get('WhatsApp', 'to_number', fallback=''))
+
+    def _create_slack_page(self):
+        """Create the Slack page."""
+        page = self._create_scrollable_page("slack")
+
+        toggle_frame = tk.Frame(page, bg=Theme.BG_SECONDARY, highlightbackground=Theme.BORDER, highlightthickness=1)
+        toggle_frame.pack(fill="x", pady=(0, 24))
+        ToggleSwitch(toggle_frame, "Enable Slack", self.slack_var).pack(fill="x")
+
+        section = FormSection(page, "Slack Configuration")
+        section.pack(fill="x")
+
+        self.slack_token = FormRow(section.content, "Bot Token", "Starts with xoxb-", show="*")
+        self.slack_token.pack(fill="x")
+        self.slack_token.set(self.config.get('Slack', 'token', fallback=''))
+
+        sep = tk.Frame(section.content, bg=Theme.BORDER, height=1)
+        sep.pack(fill="x")
+
+        self.slack_channel = FormRow(section.content, "Channel", "e.g., #notifications")
+        self.slack_channel.pack(fill="x")
+        self.slack_channel.set(self.config.get('Slack', 'channel', fallback=''))
+
+    def _create_telegram_page(self):
+        """Create the Telegram page."""
+        page = self._create_scrollable_page("telegram")
+
+        toggle_frame = tk.Frame(page, bg=Theme.BG_SECONDARY, highlightbackground=Theme.BORDER, highlightthickness=1)
+        toggle_frame.pack(fill="x", pady=(0, 24))
+        ToggleSwitch(toggle_frame, "Enable Telegram", self.telegram_var).pack(fill="x")
+
+        section = FormSection(page, "Telegram Bot Configuration")
+        section.pack(fill="x")
+
+        self.tg_token = FormRow(section.content, "Bot Token", "From @BotFather", show="*")
+        self.tg_token.pack(fill="x")
+        self.tg_token.set(self.config.get('Telegram', 'bot_token', fallback=''))
+
+        sep = tk.Frame(section.content, bg=Theme.BORDER, height=1)
+        sep.pack(fill="x")
+
+        self.tg_chat = FormRow(section.content, "Chat ID", "From @userinfobot")
+        self.tg_chat.pack(fill="x")
+        self.tg_chat.set(self.config.get('Telegram', 'chat_id', fallback=''))
+
+    def _create_discord_page(self):
+        """Create the Discord page."""
+        page = self._create_scrollable_page("discord")
+
+        toggle_frame = tk.Frame(page, bg=Theme.BG_SECONDARY, highlightbackground=Theme.BORDER, highlightthickness=1)
+        toggle_frame.pack(fill="x", pady=(0, 24))
+        ToggleSwitch(toggle_frame, "Enable Discord", self.discord_var).pack(fill="x")
+
+        section = FormSection(page, "Discord Webhook")
+        section.pack(fill="x")
+
+        self.discord_url = FormRow(section.content, "Webhook URL", "From channel integrations")
+        self.discord_url.pack(fill="x")
+        self.discord_url.set(self.config.get('Discord', 'webhook_url', fallback=''))
+
+    def _create_webhook_page(self):
+        """Create the custom webhook page."""
+        page = self._create_scrollable_page("webhook")
+
+        toggle_frame = tk.Frame(page, bg=Theme.BG_SECONDARY, highlightbackground=Theme.BORDER, highlightthickness=1)
+        toggle_frame.pack(fill="x", pady=(0, 24))
+        ToggleSwitch(toggle_frame, "Enable Custom Webhook", self.webhook_var).pack(fill="x")
+
+        section = FormSection(page, "Webhook Configuration")
+        section.pack(fill="x")
+
+        self.webhook_url = FormRow(section.content, "URL", "POST endpoint")
+        self.webhook_url.pack(fill="x")
+        self.webhook_url.set(self.config.get('CustomWebhook', 'webhook_url', fallback=''))
+
+        # Info
+        info = tk.Label(
+            page,
+            text="Sends JSON: {subject, body, sender, timestamp}",
+            bg=Theme.BG_PRIMARY,
+            fg=Theme.TEXT_MUTED,
+            font=("Segoe UI", 9)
+        )
+        info.pack(anchor="w", pady=(16, 0))
+
+    def _create_logs_page(self):
+        """Create the logs page."""
+        page = tk.Frame(self.content, bg=Theme.BG_PRIMARY)
+        self.pages["logs"] = page
 
         # Toolbar
-        toolbar = ttk.Frame(frame)
-        toolbar.pack(fill="x", pady=(0, 8))
+        toolbar = tk.Frame(page, bg=Theme.BG_PRIMARY)
+        toolbar.pack(fill="x", pady=(0, 12))
 
-        ttk.Button(toolbar, text="Clear Logs", command=self._clear_logs).pack(side="left")
+        tk.Button(
+            toolbar,
+            text="Clear",
+            command=self._clear_logs,
+            bg=Theme.BG_SECONDARY,
+            fg=Theme.TEXT_PRIMARY,
+            font=("Segoe UI", 9),
+            relief="solid",
+            bd=1,
+            padx=12,
+            pady=4,
+            cursor="hand2"
+        ).pack(side="left")
 
-        # Auto-scroll checkbox
-        self.auto_scroll_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             toolbar,
             text="Auto-scroll",
             variable=self.auto_scroll_var
         ).pack(side="left", padx=(16, 0))
 
-        # Log text area
+        # Log text
         self.log_text = scrolledtext.ScrolledText(
-            frame,
-            height=20,
-            font=('Consolas', 10),
-            bg=Theme.BG_SECONDARY,
-            fg=Theme.TEXT_PRIMARY,
-            state='disabled',
-            wrap='word'
+            page,
+            font=("Consolas", 10),
+            bg="#1e293b",
+            fg="#e2e8f0",
+            insertbackground="#e2e8f0",
+            relief="flat",
+            wrap="word",
+            state="disabled"
         )
         self.log_text.pack(fill="both", expand=True)
 
-        # Configure log tags for colors
+        # Configure tags
         self.log_text.tag_configure('INFO', foreground=Theme.LOG_INFO)
         self.log_text.tag_configure('WARNING', foreground=Theme.LOG_WARNING)
         self.log_text.tag_configure('ERROR', foreground=Theme.LOG_ERROR)
         self.log_text.tag_configure('SUCCESS', foreground=Theme.LOG_SUCCESS)
-        self.log_text.tag_configure('TIMESTAMP', foreground=Theme.TEXT_MUTED)
+        self.log_text.tag_configure('TIMESTAMP', foreground="#64748b")
 
-    def _create_status_bar(self):
-        """Create the status bar at the bottom of the window."""
-        status_frame = ttk.Frame(self.root, padding="8 4")
-        status_frame.pack(fill="x", side="bottom")
+    def _show_page(self, name: str):
+        """Show a specific page."""
+        # Update navigation
+        for key, item in self.nav_items.items():
+            item.set_active(key == name)
 
-        self.status_label = ttk.Label(
-            status_frame,
-            text="Ready",
-            style="Subheader.TLabel"
-        )
-        self.status_label.pack(side="left")
+        # Hide all pages
+        for page in self.pages.values():
+            page.pack_forget()
 
-        version_label = ttk.Label(
-            status_frame,
-            text=f"v{__version__}",
-            style="Subheader.TLabel"
-        )
-        version_label.pack(side="right")
+        # Show selected page
+        if name in self.pages:
+            self.pages[name].pack(fill="both", expand=True)
 
-    def _toggle_password_visibility(self):
-        """Toggle password field visibility."""
-        show = "" if self.show_password_var.get() else "*"
-        self.password_entry.configure(show=show)
+        # Update title
+        titles = {
+            "email": "Email Settings",
+            "settings": "General Settings",
+            "sms": "Twilio SMS",
+            "voice": "Twilio Voice",
+            "whatsapp": "WhatsApp",
+            "slack": "Slack",
+            "telegram": "Telegram",
+            "discord": "Discord",
+            "webhook": "Custom Webhook",
+            "logs": "Activity Logs"
+        }
+        self.page_title.configure(text=titles.get(name, name.title()))
+        self.current_page = name
 
     def _log(self, message: str, level: str = "INFO"):
-        """Add a message to the log queue for thread-safe logging."""
+        """Add a message to the log queue."""
         self.log_queue.put((message, level))
 
     def _process_log_queue(self):
-        """Process messages from the log queue."""
+        """Process the log queue."""
         try:
             while True:
                 message, level = self.log_queue.get_nowait()
@@ -991,13 +958,11 @@ class EmailMonitorApp:
         except queue.Empty:
             pass
         finally:
-            # Schedule next check
             self.root.after(100, self._process_log_queue)
 
     def _append_log(self, message: str, level: str = "INFO"):
-        """Append a message to the log text area."""
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        formatted_message = f"[{timestamp}] {level}: {message}\n"
+        """Append to log display."""
+        timestamp = datetime.now().strftime('%H:%M:%S')
 
         self.log_text.configure(state='normal')
         self.log_text.insert(tk.END, f"[{timestamp}] ", 'TIMESTAMP')
@@ -1009,319 +974,225 @@ class EmailMonitorApp:
             self.log_text.see(tk.END)
 
     def _clear_logs(self):
-        """Clear the log text area."""
+        """Clear the log display."""
         self.log_text.configure(state='normal')
         self.log_text.delete(1.0, tk.END)
         self.log_text.configure(state='disabled')
 
-    def _update_config_from_gui(self):
-        """Update the config object from GUI values."""
-        # Email settings
-        self.config['Email']['imap_server'] = self.imap_server_entry.get()
-        self.config['Email']['imap_port'] = self.imap_port_entry.get()
-        self.config['Email']['username'] = self.username_entry.get()
-        self.config['Email']['password'] = self.password_entry.get()
-        self.config['Email']['filter_emails'] = self.filter_emails_entry.get()
+    def _update_config(self):
+        """Update config from GUI values."""
+        # Email
+        self.config['Email']['imap_server'] = self.imap_server.get()
+        self.config['Email']['imap_port'] = self.imap_port.get()
+        self.config['Email']['username'] = self.username.get()
+        self.config['Email']['password'] = self.password.get()
+        self.config['Email']['filter_emails'] = self.filters.get()
 
-        # General settings
-        self.config['Settings']['max_sms_length'] = self.max_sms_length_entry.get()
-        self.config['Settings']['check_interval'] = self.check_interval_entry.get()
+        # Settings
+        self.config['Settings']['check_interval'] = self.check_interval.get()
+        self.config['Settings']['max_sms_length'] = self.max_sms.get()
 
-        # Notification enabled states
+        # Toggles
         self.config['Twilio']['enabled'] = str(self.twilio_sms_var.get())
         self.config['Voice']['enabled'] = str(self.voice_var.get())
         self.config['WhatsApp']['enabled'] = str(self.whatsapp_var.get())
         self.config['Slack']['enabled'] = str(self.slack_var.get())
         self.config['Telegram']['enabled'] = str(self.telegram_var.get())
         self.config['Discord']['enabled'] = str(self.discord_var.get())
-        self.config['CustomWebhook']['enabled'] = str(self.custom_webhook_var.get())
+        self.config['CustomWebhook']['enabled'] = str(self.webhook_var.get())
 
         # Twilio SMS
-        self.config['Twilio']['account_sid'] = self.twilio_sms_sid_entry.get()
-        self.config['Twilio']['auth_token'] = self.twilio_sms_token_entry.get()
-        self.config['Twilio']['from_number'] = self.twilio_sms_from_entry.get()
-        self.config['Twilio']['destination_number'] = self.twilio_sms_to_entry.get()
+        self.config['Twilio']['account_sid'] = self.sms_sid.get()
+        self.config['Twilio']['auth_token'] = self.sms_token.get()
+        self.config['Twilio']['from_number'] = self.sms_from.get()
+        self.config['Twilio']['destination_number'] = self.sms_to.get()
 
-        # Twilio Voice
-        self.config['Voice']['account_sid'] = self.twilio_voice_sid_entry.get()
-        self.config['Voice']['auth_token'] = self.twilio_voice_token_entry.get()
-        self.config['Voice']['from_number'] = self.twilio_voice_from_entry.get()
-        self.config['Voice']['destination_number'] = self.twilio_voice_to_entry.get()
+        # Voice
+        self.config['Voice']['account_sid'] = self.voice_sid.get()
+        self.config['Voice']['auth_token'] = self.voice_token.get()
+        self.config['Voice']['from_number'] = self.voice_from.get()
+        self.config['Voice']['destination_number'] = self.voice_to.get()
 
-        # Twilio WhatsApp
-        self.config['WhatsApp']['account_sid'] = self.twilio_whatsapp_sid_entry.get()
-        self.config['WhatsApp']['auth_token'] = self.twilio_whatsapp_token_entry.get()
-        self.config['WhatsApp']['from_number'] = self.twilio_whatsapp_from_entry.get()
-        self.config['WhatsApp']['to_number'] = self.twilio_whatsapp_to_entry.get()
+        # WhatsApp
+        self.config['WhatsApp']['account_sid'] = self.wa_sid.get()
+        self.config['WhatsApp']['auth_token'] = self.wa_token.get()
+        self.config['WhatsApp']['from_number'] = self.wa_from.get()
+        self.config['WhatsApp']['to_number'] = self.wa_to.get()
 
         # Slack
-        self.config['Slack']['token'] = self.slack_token_entry.get()
-        self.config['Slack']['channel'] = self.slack_channel_entry.get()
+        self.config['Slack']['token'] = self.slack_token.get()
+        self.config['Slack']['channel'] = self.slack_channel.get()
 
         # Telegram
-        self.config['Telegram']['bot_token'] = self.telegram_bot_token_entry.get()
-        self.config['Telegram']['chat_id'] = self.telegram_chat_id_entry.get()
+        self.config['Telegram']['bot_token'] = self.tg_token.get()
+        self.config['Telegram']['chat_id'] = self.tg_chat.get()
 
         # Discord
-        self.config['Discord']['webhook_url'] = self.discord_webhook_entry.get()
+        self.config['Discord']['webhook_url'] = self.discord_url.get()
 
-        # Custom Webhook
-        self.config['CustomWebhook']['webhook_url'] = self.custom_webhook_entry.get()
+        # Webhook
+        self.config['CustomWebhook']['webhook_url'] = self.webhook_url.get()
 
     def _save_settings(self):
-        """Save settings to config file."""
+        """Save settings to file."""
         try:
-            self._update_config_from_gui()
+            self._update_config()
             save_config(self.config)
-            self._log("Settings saved successfully", "SUCCESS")
-            self.status_label.configure(text="Settings saved")
-            messagebox.showinfo("Success", "Settings have been saved to config.ini")
+            self._log("Settings saved", "SUCCESS")
+            messagebox.showinfo("Saved", "Settings saved to config.ini")
         except Exception as e:
-            self._log(f"Failed to save settings: {e}", "ERROR")
-            messagebox.showerror("Error", f"Failed to save settings: {e}")
+            self._log(f"Save failed: {e}", "ERROR")
+            messagebox.showerror("Error", str(e))
 
-    def _reload_settings(self):
-        """Reload settings from config file."""
-        try:
-            self.config = load_config()
-            self._log("Settings reloaded from config.ini", "INFO")
-            messagebox.showinfo("Success", "Settings reloaded. Please restart to apply changes.")
-        except Exception as e:
-            self._log(f"Failed to reload settings: {e}", "ERROR")
-            messagebox.showerror("Error", f"Failed to reload settings: {e}")
-
-    def _test_email_connection(self):
-        """Test the email connection."""
-        self._log("Testing email connection...", "INFO")
-        self.status_label.configure(text="Testing connection...")
+    def _test_connection(self):
+        """Test email connection."""
+        self._log("Testing connection...", "INFO")
 
         def test():
-            config = EmailConfig(
-                imap_server=self.imap_server_entry.get(),
-                imap_port=int(self.imap_port_entry.get() or DEFAULT_IMAP_PORT),
-                username=self.username_entry.get(),
-                password=self.password_entry.get()
+            cfg = EmailConfig(
+                imap_server=self.imap_server.get(),
+                imap_port=int(self.imap_port.get() or 993),
+                username=self.username.get(),
+                password=self.password.get()
             )
-            success, message = test_imap_connection(config)
-            self.root.after(0, lambda: self._handle_connection_test_result(success, message))
+            success, msg = test_imap_connection(cfg)
+            self.root.after(0, lambda: self._on_test_result(success, msg))
 
         threading.Thread(target=test, daemon=True).start()
 
-    def _handle_connection_test_result(self, success: bool, message: str):
-        """Handle the result of a connection test."""
+    def _on_test_result(self, success: bool, message: str):
+        """Handle test result."""
         if success:
             self._log(message, "SUCCESS")
-            self.status_label.configure(text="Connection successful")
-            messagebox.showinfo("Connection Test", message)
+            messagebox.showinfo("Success", message)
         else:
-            self._log(f"Connection test failed: {message}", "ERROR")
-            self.status_label.configure(text="Connection failed")
-            messagebox.showerror("Connection Test", f"Failed: {message}")
+            self._log(f"Failed: {message}", "ERROR")
+            messagebox.showerror("Failed", message)
 
-    def _validate_settings(self) -> bool:
-        """Validate settings before starting monitoring."""
-        # Check notification methods
+    def _validate(self) -> bool:
+        """Validate settings."""
         if not any([
-            self.twilio_sms_var.get(),
-            self.voice_var.get(),
-            self.whatsapp_var.get(),
-            self.slack_var.get(),
-            self.telegram_var.get(),
-            self.discord_var.get(),
-            self.custom_webhook_var.get()
+            self.twilio_sms_var.get(), self.voice_var.get(), self.whatsapp_var.get(),
+            self.slack_var.get(), self.telegram_var.get(), self.discord_var.get(),
+            self.webhook_var.get()
         ]):
-            messagebox.showwarning(
-                "Configuration Required",
-                "Please enable at least one notification method."
-            )
+            messagebox.showwarning("Warning", "Enable at least one notification method.")
             return False
 
-        # Check email settings
-        if not all([
-            self.imap_server_entry.get(),
-            self.imap_port_entry.get(),
-            self.username_entry.get(),
-            self.password_entry.get()
-        ]):
-            messagebox.showwarning(
-                "Configuration Required",
-                "Please fill in all email server settings."
-            )
-            return False
-
-        # Validate check interval
-        try:
-            interval = int(self.check_interval_entry.get())
-            if interval <= 0:
-                raise ValueError()
-        except ValueError:
-            messagebox.showwarning(
-                "Invalid Settings",
-                "Check interval must be a positive number."
-            )
+        if not all([self.imap_server.get(), self.username.get(), self.password.get()]):
+            messagebox.showwarning("Warning", "Fill in email settings.")
             return False
 
         return True
 
     def _start_monitoring(self):
-        """Start the email monitoring process."""
-        if not self._validate_settings():
+        """Start monitoring."""
+        if not self._validate():
             return
 
-        # Update config from GUI
-        self._update_config_from_gui()
-
+        self._update_config()
         self.monitoring = True
         self.stop_event.clear()
 
-        # Update UI
-        self.start_button.configure(state="disabled")
-        self.stop_button.configure(state="normal")
-        self.status_indicator.set_active(True, "Monitoring")
-        self.status_label.configure(text="Monitoring active")
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.status_badge.set_active(True, "Monitoring")
 
-        self._log("Starting email monitoring", "INFO")
-
-        # Start monitoring thread
+        self._log("Monitoring started", "INFO")
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.monitor_thread.start()
 
     def _stop_monitoring(self):
-        """Stop the email monitoring process."""
+        """Stop monitoring."""
         self.monitoring = False
         self.stop_event.set()
 
-        # Update UI
-        self.start_button.configure(state="normal")
-        self.stop_button.configure(state="disabled")
-        self.status_indicator.set_active(False, "Stopped")
-        self.status_label.configure(text="Monitoring stopped")
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.status_badge.set_active(False, "Stopped")
 
         self._log("Monitoring stopped", "INFO")
 
     def _monitor_loop(self):
-        """Main monitoring loop running in background thread."""
-        # Create dispatcher
+        """Main monitoring loop."""
         dispatcher = NotificationDispatcher(self.config)
 
         while not self.stop_event.is_set():
             imap = None
             try:
-                # Get settings
-                check_interval = int(self.config.get('Settings', 'check_interval', fallback=str(DEFAULT_CHECK_INTERVAL)))
-                filter_emails = [
-                    f.strip().lower()
-                    for f in self.config.get('Email', 'filter_emails', fallback='').split(',')
-                    if f.strip()
-                ]
+                interval = int(self.config.get('Settings', 'check_interval', fallback='60'))
+                filters = [f.strip().lower() for f in self.config.get('Email', 'filter_emails', fallback='').split(',') if f.strip()]
 
-                # Connect to IMAP
                 imap = connect_to_imap(
                     self.config.get('Email', 'imap_server'),
-                    int(self.config.get('Email', 'imap_port', fallback=str(DEFAULT_IMAP_PORT))),
+                    int(self.config.get('Email', 'imap_port', fallback='993')),
                     self.config.get('Email', 'username'),
                     self.config.get('Email', 'password')
                 )
 
                 if not imap:
-                    self._log(f"Failed to connect to IMAP. Retrying in {check_interval}s...", "WARNING")
-                    self.stop_event.wait(check_interval)
+                    self._log(f"Connection failed. Retry in {interval}s", "WARNING")
+                    self.stop_event.wait(interval)
                     continue
 
-                # Fetch unread emails
-                unread_emails = fetch_unread_emails(imap)
-                self._log(f"Found {len(unread_emails)} unread email(s)", "INFO")
+                emails = fetch_unread_emails(imap)
+                self._log(f"Found {len(emails)} unread email(s)", "INFO")
 
-                # Process each email
-                for email_id, msg in unread_emails:
+                for email_id, msg in emails:
                     if self.stop_event.is_set():
                         break
 
-                    sender_email = get_sender_email(msg)
-
-                    # Apply filters
-                    if filter_emails and not check_email_filter(sender_email, filter_emails):
-                        self._log(f"Email from {sender_email} filtered out", "INFO")
+                    sender = get_sender_email(msg)
+                    if filters and not check_email_filter(sender, filters):
                         continue
 
-                    # Extract email content
                     subject = decode_email_subject(msg)
                     body = extract_email_body(msg)
 
-                    self._log(f"Processing: {subject[:50]}...", "INFO")
+                    self._log(f"Processing: {subject[:40]}...", "INFO")
 
-                    # Create notification
                     notification = EmailNotification(
                         email_id=email_id,
-                        sender=sender_email,
+                        sender=sender,
                         subject=subject,
                         body=body
                     )
 
-                    # Send notifications
                     results = dispatcher.dispatch(
                         notification,
                         callback=lambda r: self._log(
-                            f"{r.service}: {'Success' if r.success else 'Failed'} - {r.message}",
+                            f"{r.service}: {r.message}",
                             "SUCCESS" if r.success else "ERROR"
                         )
                     )
 
-                    # Mark as read if any notification succeeded
                     if any(r.success for r in results):
-                        if mark_as_read(imap, email_id):
-                            self._log(f"Marked email {email_id.decode()} as read", "INFO")
-                    else:
-                        self._log(f"No notifications sent for {email_id.decode()}", "WARNING")
+                        mark_as_read(imap, email_id)
 
             except Exception as e:
-                self._log(f"Error in monitoring loop: {e}", "ERROR")
+                self._log(f"Error: {e}", "ERROR")
             finally:
                 if imap:
                     try:
                         imap.logout()
-                    except Exception:
+                    except:
                         pass
 
-                # Wait for next check
                 if not self.stop_event.is_set():
-                    check_interval = int(self.config.get('Settings', 'check_interval', fallback=str(DEFAULT_CHECK_INTERVAL)))
-                    self._log(f"Next check in {check_interval} seconds", "INFO")
-                    self.stop_event.wait(check_interval)
-
-    def _show_docs(self):
-        """Show documentation."""
-        import webbrowser
-        webbrowser.open("https://github.com/morroware/e2nb")
-
-    def _show_about(self):
-        """Show the About dialog."""
-        messagebox.showinfo(
-            "About E2NB",
-            f"E2NB - Email to Notification Blaster\n\n"
-            f"Version: {__version__}\n"
-            f"Author: Seth Morrow\n\n"
-            f"A professional email monitoring application that forwards\n"
-            f"notifications through multiple channels.\n\n"
-            f"License: MIT"
-        )
+                    interval = int(self.config.get('Settings', 'check_interval', fallback='60'))
+                    self.stop_event.wait(interval)
 
     def _on_close(self):
-        """Handle window close event."""
+        """Handle window close."""
         if self.monitoring:
-            if messagebox.askyesno("Confirm Exit", "Monitoring is active. Stop and exit?"):
+            if messagebox.askyesno("Confirm", "Stop monitoring and exit?"):
                 self._stop_monitoring()
             else:
                 return
         self.root.destroy()
 
 
-# =============================================================================
-# Entry Point
-# =============================================================================
-
 def main():
-    """Application entry point."""
     root = tk.Tk()
     app = EmailMonitorApp(root)
     root.mainloop()
