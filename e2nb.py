@@ -147,6 +147,10 @@ class SidebarSection(tk.Frame):
     def __init__(self, parent, text: str, **kwargs):
         super().__init__(parent, bg=Theme.SIDEBAR_BG, **kwargs)
 
+        # Top spacer
+        spacer = tk.Frame(self, bg=Theme.SIDEBAR_BG, height=12)
+        spacer.pack(fill="x")
+
         self.label = tk.Label(
             self,
             text=text.upper(),
@@ -155,7 +159,7 @@ class SidebarSection(tk.Frame):
             font=("Segoe UI", 8, "bold"),
             anchor="w"
         )
-        self.label.pack(fill="x", padx=16, pady=(16, 4))
+        self.label.pack(fill="x", padx=16, pady=4)
 
 
 # =============================================================================
