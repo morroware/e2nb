@@ -1060,8 +1060,9 @@ class EmailMonitorApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("E2NB - Email to Notification Blaster")
-        self.root.geometry("1080x740")
         self.root.minsize(940, 640)
+        # Launch at maximum windowed size (not fullscreen)
+        self.root.state("zoomed")
         self.root.configure(bg=Theme.BG_PRIMARY)
 
         try:
