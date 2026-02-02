@@ -491,13 +491,16 @@ class EmailMonitorDaemon:
                             for uid, msg in unread_emails:
                                 if self.stop_event.is_set():
                                     break
-                                self._process_email_by_uid(imap, uid, msg, email_config.filter_emails)
-                                # Always advance last_uid regardless of filter/dispatch
-                                # outcome. Messages are processed in ascending UID order,
-                                # so advancing prevents re-fetching the same message
-                                # every cycle (starvation) and avoids skipping older
-                                # UIDs when a newer one succeeds first.
-                                monitor_state.set_imap_last_uid(imap_key_server, imap_key_user, uid)
+                                result = self._process_email_by_uid(imap, uid, msg, email_config.filter_emails)
+                                # Advance last_uid only if:
+                                # - result is True: notification sent successfully
+                                # - result is None: email was filtered out (intentional skip)
+                                # Do NOT advance if result is False (delivery failed),
+                                # allowing the email to be retried on the next cycle.
+                                if result is not False:
+                                    monitor_state.set_imap_last_uid(imap_key_server, imap_key_user, uid)
+                                else:
+                                    logging.warning(f"Notification delivery failed for UID {uid}; will retry next cycle")
                         else:
                             logging.warning("Failed to connect to IMAP server")
 
@@ -543,8 +546,11 @@ class EmailMonitorDaemon:
                                 body = extract_email_body(msg)
 
                                 # Create hash to track this message and avoid duplicates
+                                # Include Message-ID and Date headers to reduce collision risk
+                                msg_id = msg.get('Message-ID', '') or ''
+                                msg_date = msg.get('Date', '') or ''
                                 msg_hash = hashlib.md5(
-                                    f"{sender}{subject}{body[:500]}".encode()
+                                    f"{msg_id}{msg_date}{sender}{subject}{body}".encode()
                                 ).hexdigest()
 
                                 # Skip if already processed
@@ -659,7 +665,7 @@ class EmailMonitorDaemon:
                     logging.debug(f"Sleeping for {sleep_time:.1f} seconds until next check")
                     self.stop_event.wait(sleep_time)
 
-    def _process_email_by_uid(self, imap, uid: int, msg, filter_emails: list) -> bool:
+    def _process_email_by_uid(self, imap, uid: int, msg, filter_emails: list) -> Optional[bool]:
         """
         Process a single email using UID.
 
@@ -670,15 +676,17 @@ class EmailMonitorDaemon:
             filter_emails: List of email filter patterns.
 
         Returns:
-            True if notification was sent successfully, False otherwise.
+            True if notification was sent successfully.
+            False if notification delivery failed.
+            None if email was filtered out (intentionally skipped).
         """
         # Extract sender
         sender_email = get_sender_email(msg)
 
-        # Apply filters
+        # Apply filters - return None to indicate intentional skip
         if filter_emails and not check_email_filter(sender_email, filter_emails):
             logging.info(f"Email from {sender_email} does not match filters. Skipping.")
-            return False
+            return None
 
         # Extract email content
         subject = decode_email_subject(msg)
