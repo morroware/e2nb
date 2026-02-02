@@ -13,6 +13,7 @@ Version: 1.0.0
 
 from __future__ import annotations
 
+import asyncio
 import configparser
 import hashlib
 import imaplib
@@ -22,9 +23,11 @@ import os
 import re
 import smtplib
 import ssl
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+import email as email_module
 from email.header import decode_header
 from email.message import Message
 from email.mime.multipart import MIMEMultipart
@@ -69,6 +72,14 @@ except ImportError:
     BS4_AVAILABLE = False
     BeautifulSoup = None
 
+try:
+    from aiosmtpd.controller import Controller as SmtpdController
+    from aiosmtpd.smtp import SMTP as AIOSMTP
+    AIOSMTPD_AVAILABLE = True
+except ImportError:
+    AIOSMTPD_AVAILABLE = False
+    SmtpdController = None
+
 # Version information
 __version__ = "1.0.0"
 __author__ = "Seth Morrow"
@@ -106,7 +117,7 @@ class ConfigurationError(E2NBError):
     pass
 
 
-class ConnectionError(E2NBError):
+class E2NBConnectionError(E2NBError):
     """Raised when connection to a service fails."""
     pass
 
@@ -283,6 +294,36 @@ class SmtpConfig:
             from_address=section.get('from_address', ''),
             to_addresses=to_addresses,
             subject_prefix=section.get('subject_prefix', '[E2NB]')
+        )
+
+
+@dataclass
+class SmtpReceiverConfig:
+    """SMTP receiver configuration for receiving emails via SMTP."""
+    enabled: bool = False
+    host: str = "0.0.0.0"
+    port: int = 2525
+    use_auth: bool = False
+    username: str = ""
+    password: str = ""
+    filter_emails: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_config(cls, config: configparser.ConfigParser) -> 'SmtpReceiverConfig':
+        """Create SmtpReceiverConfig from ConfigParser."""
+        if 'SmtpReceiver' not in config:
+            return cls()
+        section = config['SmtpReceiver']
+        filter_str = section.get('filter_emails', '')
+        filters = [f.strip().lower() for f in filter_str.split(',') if f.strip()]
+        return cls(
+            enabled=section.getboolean('enabled', fallback=False),
+            host=section.get('host', '0.0.0.0'),
+            port=int(section.get('port', '2525')),
+            use_auth=section.getboolean('use_auth', fallback=False),
+            username=section.get('username', ''),
+            password=section.get('password', ''),
+            filter_emails=filters
         )
 
 
@@ -524,10 +565,10 @@ def sanitize_twiml(text: str) -> str:
     Returns:
         Sanitized text safe for TwiML.
     """
-    # HTML escape for XML safety
-    sanitized = html_escape(text)
-    # Remove any potential SSML injection
-    sanitized = re.sub(r'<[^>]+>', '', sanitized)
+    # Remove any potential SSML/HTML injection first
+    sanitized = re.sub(r'<[^>]+>', '', text)
+    # Then HTML escape for XML safety
+    sanitized = html_escape(sanitized)
     # Limit length to prevent abuse
     return sanitized[:3000]
 
@@ -714,6 +755,16 @@ def create_default_config(config_file: str = CONFIG_FILE_PATH) -> None:
         'subject_prefix': '[E2NB]'
     }
 
+    config['SmtpReceiver'] = {
+        'enabled': 'False',
+        'host': '0.0.0.0',
+        'port': '2525',
+        'use_auth': 'False',
+        'username': '',
+        'password': '',
+        'filter_emails': ''
+    }
+
     # Monitoring Sources
     config['RSS'] = {
         'enabled': 'False',
@@ -857,7 +908,6 @@ def fetch_unread_emails(
             res, msg_data = imap.fetch(email_id, "(RFC822)")
             for response in msg_data:
                 if isinstance(response, tuple):
-                    import email as email_module
                     msg = email_module.message_from_bytes(response[1])
                     emails.append((email_id, msg))
 
@@ -1211,6 +1261,9 @@ def send_telegram_message(
 
     try:
         message = f"*{subject}*\n{body}"
+        # Telegram message limit is 4096 characters
+        if len(message) > 4096:
+            message = message[:4093] + "..."
         url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
         params = {
             'chat_id': chat_id,
@@ -1255,7 +1308,11 @@ def send_discord_message(
         return NotificationResult(False, "Discord", "Invalid webhook URL")
 
     try:
-        data = {"content": f"**{subject}**\n{body}"}
+        content = f"**{subject}**\n{body}"
+        # Discord message limit is 2000 characters
+        if len(content) > 2000:
+            content = content[:1997] + "..."
+        data = {"content": content}
 
         http_session = session or create_http_session()
         response = http_session.post(webhook_url, json=data, timeout=DEFAULT_TIMEOUT)
@@ -1726,7 +1783,7 @@ class MonitorState:
                 logger.warning(f"Could not load state file: {e}")
 
     def save(self):
-        """Save state to file."""
+        """Save state to file atomically."""
         try:
             # Convert sets to lists for JSON serialization
             state_to_save = self._state.copy()
@@ -1736,8 +1793,11 @@ class MonitorState:
                 }
             state_to_save['last_updated'] = datetime.now().isoformat()
 
-            with open(self.state_file, 'w') as f:
+            # Write to temp file then rename for atomicity
+            tmp_file = self.state_file + '.tmp'
+            with open(tmp_file, 'w') as f:
                 json.dump(state_to_save, f, indent=2)
+            os.replace(tmp_file, self.state_file)
         except IOError as e:
             logger.error(f"Could not save state file: {e}")
 
@@ -2303,3 +2363,182 @@ def test_http_endpoint(url: str, method: str = 'GET', expected_status: int = 200
         return True, f"Endpoint OK - Status: {status_code}, Response time: {response_time:.2f}s"
     else:
         return False, f"Endpoint check failed: {error}"
+
+
+# =============================================================================
+# SMTP Receiver (Email monitoring via SMTP)
+# =============================================================================
+
+class _SmtpHandler:
+    """aiosmtpd handler that processes incoming emails."""
+
+    def __init__(
+        self,
+        callback: Callable[[EmailNotification], None],
+        filters: List[str],
+        use_auth: bool = False,
+        username: str = "",
+        password: str = "",
+    ):
+        self._callback = callback
+        self._filters = filters
+        self._use_auth = use_auth
+        self._username = username
+        self._password = password
+
+    async def handle_RCPT(self, server, session, envelope, address, rcpt_options):
+        envelope.rcpt_tos.append(address)
+        return '250 OK'
+
+    async def handle_DATA(self, server, session, envelope):
+        try:
+            msg = email_module.message_from_bytes(envelope.content)
+            sender = get_sender_email(msg)
+
+            # Apply filters
+            if self._filters and not check_email_filter(sender, self._filters):
+                logger.debug(f"SMTP receiver: email from {sender} filtered out")
+                return '250 OK'
+
+            subject = decode_email_subject(msg)
+            body = extract_email_body(msg)
+
+            notification = EmailNotification(
+                email_id=hashlib.md5(envelope.content[:1024]).hexdigest().encode(),
+                sender=sender,
+                subject=subject,
+                body=body,
+            )
+
+            logger.info(f"SMTP receiver: received email from {sender}: {subject[:60]}")
+            self._callback(notification)
+
+        except Exception as e:
+            logger.error(f"SMTP receiver: error processing email: {e}")
+
+        return '250 OK'
+
+
+class _SmtpAuthenticator:
+    """Simple authenticator for the SMTP receiver."""
+
+    def __init__(self, username: str, password: str):
+        self._username = username
+        self._password = password
+
+    def __call__(self, server, session, envelope, mechanism, auth_data):
+        try:
+            if mechanism == 'LOGIN' or mechanism == 'PLAIN':
+                login = auth_data.login.decode() if isinstance(auth_data.login, bytes) else auth_data.login
+                pwd = auth_data.password.decode() if isinstance(auth_data.password, bytes) else auth_data.password
+                if login == self._username and pwd == self._password:
+                    return True
+            return False
+        except Exception:
+            return False
+
+
+class SmtpReceiver:
+    """
+    SMTP server that receives emails and dispatches notifications.
+
+    Runs an aiosmtpd server on a configurable port. Other mail systems
+    can forward/relay emails to this server, which then processes them
+    through the notification pipeline.
+    """
+
+    def __init__(
+        self,
+        config: SmtpReceiverConfig,
+        callback: Callable[[EmailNotification], None],
+    ):
+        self._config = config
+        self._callback = callback
+        self._controller = None
+        self._thread = None
+        self._running = False
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    def start(self) -> Tuple[bool, str]:
+        """Start the SMTP receiver server."""
+        if not AIOSMTPD_AVAILABLE:
+            return False, "aiosmtpd not installed (pip install aiosmtpd)"
+
+        if self._running:
+            return False, "SMTP receiver already running"
+
+        try:
+            handler = _SmtpHandler(
+                callback=self._callback,
+                filters=self._config.filter_emails,
+                use_auth=self._config.use_auth,
+                username=self._config.username,
+                password=self._config.password,
+            )
+
+            kwargs = {
+                'handler': handler,
+                'hostname': self._config.host,
+                'port': self._config.port,
+            }
+
+            if self._config.use_auth and self._config.username:
+                kwargs['authenticator'] = _SmtpAuthenticator(
+                    self._config.username, self._config.password
+                )
+                kwargs['auth_require_tls'] = False
+
+            self._controller = SmtpdController(**kwargs)
+            self._controller.start()
+            self._running = True
+
+            addr = f"{self._config.host}:{self._config.port}"
+            logger.info(f"SMTP receiver started on {addr}")
+            return True, f"SMTP receiver listening on {addr}"
+
+        except OSError as e:
+            msg = f"Failed to start SMTP receiver: {e}"
+            logger.error(msg)
+            return False, msg
+        except Exception as e:
+            msg = f"Failed to start SMTP receiver: {e}"
+            logger.error(msg)
+            return False, msg
+
+    def stop(self):
+        """Stop the SMTP receiver server."""
+        if self._controller and self._running:
+            try:
+                self._controller.stop()
+            except Exception as e:
+                logger.error(f"Error stopping SMTP receiver: {e}")
+            self._running = False
+            logger.info("SMTP receiver stopped")
+
+    def __del__(self):
+        self.stop()
+
+
+def test_smtp_receiver_port(host: str, port: int) -> Tuple[bool, str]:
+    """
+    Test if an SMTP receiver can bind to the given host:port.
+
+    Args:
+        host: Hostname to bind to.
+        port: Port to bind to.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    import socket
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        sock.bind((host, port))
+        sock.close()
+        return True, f"Port {port} is available"
+    except OSError as e:
+        return False, f"Cannot bind to {host}:{port}: {e}"

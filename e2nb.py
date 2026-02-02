@@ -64,6 +64,8 @@ from e2nb_core import (
     NotificationDispatcher,
     EmailConfig,
     SmtpConfig,
+    SmtpReceiverConfig,
+    SmtpReceiver,
     RssFeedConfig,
     WebMonitorConfig,
     HttpEndpointConfig,
@@ -71,6 +73,7 @@ from e2nb_core import (
     MonitorEvent,
     test_imap_connection,
     test_smtp_connection,
+    test_smtp_receiver_port,
     test_rss_feed,
     test_http_endpoint,
     check_rss_feeds,
@@ -81,6 +84,7 @@ from e2nb_core import (
     DEFAULT_IMAP_PORT,
     FEEDPARSER_AVAILABLE,
     BS4_AVAILABLE,
+    AIOSMTPD_AVAILABLE,
 )
 
 
@@ -1099,6 +1103,7 @@ class EmailMonitorApp:
         self.monitor_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
         self.log_queue: queue.Queue = queue.Queue()
+        self.smtp_receiver: Optional[SmtpReceiver] = None
         self.current_page = "email"
         self.nav_items: Dict[str, SidebarItem] = {}
         self.pages: Dict[str, tk.Frame] = {}
@@ -1143,6 +1148,9 @@ class EmailMonitorApp:
         self.discord_var = tk.BooleanVar(value=self.config.getboolean('Discord', 'enabled', fallback=False))
         self.webhook_var = tk.BooleanVar(value=self.config.getboolean('CustomWebhook', 'enabled', fallback=False))
         self.smtp_var = tk.BooleanVar(value=self.config.getboolean('SMTP', 'enabled', fallback=False))
+
+        # SMTP Receiver
+        self.smtp_recv_var = tk.BooleanVar(value=self.config.getboolean('SmtpReceiver', 'enabled', fallback=False))
 
         # Monitoring sources
         self.rss_var = tk.BooleanVar(value=self.config.getboolean('RSS', 'enabled', fallback=False))
@@ -1555,6 +1563,114 @@ class EmailMonitorApp:
         )
         self.filters.pack(fill="x")
         self.filters.set(self.config.get('Email', 'filter_emails', fallback=''))
+
+        # SMTP Receiver section
+        section4 = FormSection(
+            page, "SMTP Receiver (Alternative to IMAP)",
+            "Run a local SMTP server to receive emails directly. "
+            "Other systems can forward mail to this server."
+        )
+        section4.pack(fill="x", pady=(24, 0))
+
+        # Enable toggle
+        smtp_recv_toggle = tk.Frame(section4.content, bg=Theme.BG_PRIMARY)
+        smtp_recv_toggle.pack(fill="x")
+        ToggleSwitch(smtp_recv_toggle, "Enable SMTP Receiver", self.smtp_recv_var).pack(fill="x")
+
+        self._create_separator(section4.content)
+
+        if not AIOSMTPD_AVAILABLE:
+            warning_frame = tk.Frame(section4.content, bg=Theme.WARNING_LIGHT)
+            warning_frame.pack(fill="x", padx=16, pady=8)
+            tk.Label(
+                warning_frame,
+                text="aiosmtpd not installed. Run: pip install aiosmtpd",
+                bg=Theme.WARNING_LIGHT, fg=Theme.TEXT_PRIMARY, font=(Theme.FONT, 9),
+                padx=12, pady=8,
+            ).pack(fill="x")
+
+        self.smtp_recv_host = FormRow(
+            section4.content, "Listen Host", "0.0.0.0 for all interfaces",
+            tooltip="Network interface to bind to (0.0.0.0 = all)",
+        )
+        self.smtp_recv_host.pack(fill="x")
+        self.smtp_recv_host.set(self.config.get('SmtpReceiver', 'host', fallback='0.0.0.0'))
+
+        self._create_separator(section4.content)
+
+        self.smtp_recv_port = FormRow(
+            section4.content, "Listen Port", "Default: 2525",
+            tooltip="Port for the SMTP receiver (use 2525 to avoid needing root)",
+        )
+        self.smtp_recv_port.pack(fill="x")
+        self.smtp_recv_port.set(self.config.get('SmtpReceiver', 'port', fallback='2525'))
+
+        self._create_separator(section4.content)
+
+        self.smtp_recv_auth_var = tk.BooleanVar(
+            value=self.config.getboolean('SmtpReceiver', 'use_auth', fallback=False)
+        )
+        auth_frame = tk.Frame(section4.content, bg=Theme.BG_PRIMARY)
+        auth_frame.pack(fill="x")
+        ToggleSwitch(auth_frame, "Require Authentication", self.smtp_recv_auth_var).pack(fill="x")
+
+        self._create_separator(section4.content)
+
+        self.smtp_recv_username = FormRow(
+            section4.content, "Username", "For SMTP auth (optional)",
+            tooltip="Username clients must use to authenticate",
+        )
+        self.smtp_recv_username.pack(fill="x")
+        self.smtp_recv_username.set(self.config.get('SmtpReceiver', 'username', fallback=''))
+
+        self._create_separator(section4.content)
+
+        self.smtp_recv_password = FormRow(
+            section4.content, "Password", "For SMTP auth (optional)", show="*",
+            tooltip="Password clients must use to authenticate",
+        )
+        self.smtp_recv_password.pack(fill="x")
+        self.smtp_recv_password.set(self.config.get('SmtpReceiver', 'password', fallback=''))
+
+        self._create_separator(section4.content)
+
+        self.smtp_recv_filters = FormRow(
+            section4.content, "Filter", "Comma-separated addresses or @domains",
+            tooltip="Only process emails from these senders",
+        )
+        self.smtp_recv_filters.pack(fill="x")
+        self.smtp_recv_filters.set(self.config.get('SmtpReceiver', 'filter_emails', fallback=''))
+
+        # Test port button
+        smtp_recv_btn_frame = tk.Frame(page, bg=Theme.BG_SECONDARY)
+        smtp_recv_btn_frame.pack(fill="x", pady=(12, 0))
+
+        ModernButton(
+            smtp_recv_btn_frame, text="Test Port",
+            command=self._test_smtp_receiver_port,
+            bg=Theme.BG_PRIMARY, fg=Theme.TEXT_PRIMARY,
+            hover_bg=Theme.BG_TERTIARY,
+            tooltip="Check if the SMTP receiver port is available",
+        ).pack(side="left")
+
+    def _test_smtp_receiver_port(self):
+        """Test if the SMTP receiver port is available."""
+        host = self.smtp_recv_host.get() or '0.0.0.0'
+        port = int(self.smtp_recv_port.get() or 2525)
+
+        def test():
+            success, msg = test_smtp_receiver_port(host, port)
+            self.root.after(0, lambda: self._on_smtp_recv_test(success, msg))
+
+        threading.Thread(target=test, daemon=True).start()
+
+    def _on_smtp_recv_test(self, success: bool, message: str):
+        if success:
+            self._log(message, "SUCCESS")
+            self.toast.show(message, "success")
+        else:
+            self._log(f"Port test failed: {message}", "ERROR")
+            self.toast.show(message, "error")
 
     def _create_settings_page(self):
         page = self._create_scrollable_page("settings")
@@ -2320,6 +2436,17 @@ class EmailMonitorApp:
         self.config['SMTP']['to_addresses'] = self.smtp_to.get()
         self.config['SMTP']['subject_prefix'] = self.smtp_prefix.get()
 
+        # SMTP Receiver settings
+        if 'SmtpReceiver' not in self.config:
+            self.config['SmtpReceiver'] = {}
+        self.config['SmtpReceiver']['enabled'] = str(self.smtp_recv_var.get())
+        self.config['SmtpReceiver']['host'] = self.smtp_recv_host.get()
+        self.config['SmtpReceiver']['port'] = self.smtp_recv_port.get()
+        self.config['SmtpReceiver']['use_auth'] = str(self.smtp_recv_auth_var.get())
+        self.config['SmtpReceiver']['username'] = self.smtp_recv_username.get()
+        self.config['SmtpReceiver']['password'] = self.smtp_recv_password.get()
+        self.config['SmtpReceiver']['filter_emails'] = self.smtp_recv_filters.get()
+
         # RSS settings
         if 'RSS' not in self.config:
             self.config['RSS'] = {}
@@ -2383,8 +2510,10 @@ class EmailMonitorApp:
         if not any(v.get() for v in self._service_vars()):
             self.toast.show("Enable at least one notification method.", "error")
             return False
-        if not all([self.imap_server.get(), self.username.get(), self.password.get()]):
-            self.toast.show("Fill in email settings first.", "error")
+        has_imap = all([self.imap_server.get(), self.username.get(), self.password.get()])
+        has_smtp_recv = self.smtp_recv_var.get()
+        if not has_imap and not has_smtp_recv:
+            self.toast.show("Configure IMAP or enable SMTP Receiver.", "error")
             return False
         return True
 
@@ -2401,6 +2530,38 @@ class EmailMonitorApp:
         self.status_badge.set_active(True, "Monitoring")
         self._update_status_bar("Monitoring active")
 
+        # Start SMTP receiver if enabled
+        if self.smtp_recv_var.get():
+            smtp_recv_config = SmtpReceiverConfig(
+                enabled=True,
+                host=self.smtp_recv_host.get() or '0.0.0.0',
+                port=int(self.smtp_recv_port.get() or 2525),
+                use_auth=self.smtp_recv_auth_var.get(),
+                username=self.smtp_recv_username.get(),
+                password=self.smtp_recv_password.get(),
+                filter_emails=[
+                    f.strip().lower()
+                    for f in self.smtp_recv_filters.get().split(',')
+                    if f.strip()
+                ],
+            )
+            dispatcher = NotificationDispatcher(self.config)
+            self.smtp_receiver = SmtpReceiver(
+                config=smtp_recv_config,
+                callback=lambda notif: self._on_smtp_received(notif, dispatcher),
+            )
+            success, msg = self.smtp_receiver.start()
+            if success:
+                self._log(msg, "SUCCESS")
+            else:
+                self._log(msg, "ERROR")
+                self.toast.show(msg, "error")
+                self.monitoring = False
+                self.start_btn.configure_state("normal")
+                self.stop_btn.configure_state("disabled")
+                self.status_badge.set_active(False)
+                return
+
         self._log("Monitoring started", "INFO")
         self.toast.show("Email monitoring started", "success")
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
@@ -2410,12 +2571,31 @@ class EmailMonitorApp:
         self.monitoring = False
         self.stop_event.set()
 
+        # Stop SMTP receiver
+        if self.smtp_receiver and self.smtp_receiver.is_running:
+            self.smtp_receiver.stop()
+            self.smtp_receiver = None
+            self._log("SMTP receiver stopped", "INFO")
+
         self.start_btn.configure_state("normal")
         self.stop_btn.configure_state("disabled")
         self.status_badge.set_active(False, "Stopped")
         self._update_status_bar("Monitoring stopped")
 
         self._log("Monitoring stopped", "INFO")
+
+    def _on_smtp_received(self, notification: EmailNotification, dispatcher: NotificationDispatcher):
+        """Handle an email received via the SMTP receiver."""
+        self._log(f"SMTP Receiver: {notification.sender} - {notification.subject[:50]}", "INFO")
+        results = dispatcher.dispatch(
+            notification,
+            callback=lambda r: self._log(
+                f"{r.service}: {r.message}",
+                "SUCCESS" if r.success else "ERROR"
+            )
+        )
+        success_count = sum(1 for r in results if r.success)
+        self._log(f"Dispatched {success_count}/{len(results)} notifications", "INFO")
 
     def _monitor_loop(self):
         dispatcher = NotificationDispatcher(self.config)
@@ -2438,14 +2618,18 @@ class EmailMonitorApp:
                 ))
 
                 # =====================================================
-                # Check Email (IMAP)
+                # Check Email (IMAP) - skip if no credentials
                 # =====================================================
-                imap = connect_to_imap(
-                    self.config.get('Email', 'imap_server'),
-                    int(self.config.get('Email', 'imap_port', fallback='993')),
-                    self.config.get('Email', 'username'),
-                    self.config.get('Email', 'password')
-                )
+                imap_username = self.config.get('Email', 'username', fallback='')
+                if imap_username:
+                    imap = connect_to_imap(
+                        self.config.get('Email', 'imap_server'),
+                        int(self.config.get('Email', 'imap_port', fallback='993')),
+                        imap_username,
+                        self.config.get('Email', 'password')
+                    )
+                else:
+                    imap = None
 
                 if imap:
                     emails = fetch_unread_emails(imap)
@@ -2482,7 +2666,7 @@ class EmailMonitorApp:
 
                         if any(r.success for r in results):
                             mark_as_read(imap, email_id)
-                else:
+                elif imap_username:
                     self._log("Email connection failed", "WARNING")
 
                 # =====================================================
@@ -2561,7 +2745,7 @@ class EmailMonitorApp:
                 if imap:
                     try:
                         imap.logout()
-                    except:
+                    except Exception:
                         pass
 
                 if not self.stop_event.is_set():
