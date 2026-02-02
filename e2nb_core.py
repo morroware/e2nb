@@ -1603,10 +1603,11 @@ def fetch_unread_emails_by_uid(
     last_seen_uid: int = 0
 ) -> Tuple[List[Tuple[int, Message]], int]:
     """
-    Retrieve unread emails using UID for persistent tracking across sessions.
+    Retrieve new emails using UID range for persistent tracking across sessions.
 
-    UIDs are persistent across sessions (unlike sequence numbers), making this
-    suitable for avoiding re-processing emails across restarts or expunges.
+    Uses UID range (not UNSEEN flag) so that messages marked as read by other
+    clients are still processed. UIDs are persistent across sessions (unlike
+    sequence numbers), making this suitable for avoiding re-processing.
 
     Args:
         imap: Authenticated IMAP connection.
@@ -1614,20 +1615,21 @@ def fetch_unread_emails_by_uid(
         last_seen_uid: Only fetch emails with UID > this value.
 
     Returns:
-        Tuple of (list of (uid, message) tuples, highest_uid_seen).
+        Tuple of (list of (uid, message) tuples sorted ascending, highest_uid_seen).
     """
     try:
         imap.select("inbox")
 
-        # Search for unseen emails with UID greater than last seen
+        # Search by UID range only — do NOT filter by UNSEEN, because other
+        # clients or server-side rules may mark messages as Seen before we
+        # process them, leading to silent missed notifications.
         if last_seen_uid > 0:
-            # UID SEARCH for unseen messages with UID > last_seen_uid
-            status, messages = imap.uid('search', None, f'UNSEEN UID {last_seen_uid + 1}:*')
+            status, messages = imap.uid('search', None, f'UID {last_seen_uid + 1}:*')
         else:
-            status, messages = imap.uid('search', None, 'UNSEEN')
+            status, messages = imap.uid('search', None, 'ALL')
 
         if status != "OK":
-            logger.info("No unread emails found.")
+            logger.info("No new emails found.")
             return [], last_seen_uid
 
         uid_list = messages[0].split()
@@ -1636,13 +1638,16 @@ def fetch_unread_emails_by_uid(
             return [], last_seen_uid
 
         # Convert to integers and filter out UIDs <= last_seen_uid
+        # (IMAP UID range search can return last_seen_uid itself)
         uids = [int(uid) for uid in uid_list if int(uid) > last_seen_uid]
 
         if not uids:
             return [], last_seen_uid
 
-        # Sort descending (most recent first) and limit
-        uids = sorted(uids, reverse=True)[:max_emails]
+        # Sort ascending (oldest first) so we process in chronological order.
+        # This ensures last_uid advances monotonically and we never skip older
+        # messages if a newer one is processed first.
+        uids = sorted(uids)[:max_emails]
 
         emails = []
         highest_uid = last_seen_uid
@@ -1856,9 +1861,48 @@ def test_pop3_connection(config: EmailConfig) -> Tuple[bool, str]:
         return False, f"POP3 connection error: {e}"
 
 
+def _strip_html(html_text: str) -> str:
+    """
+    Convert HTML to plain text.
+
+    Uses BeautifulSoup if available for high-quality extraction,
+    otherwise falls back to a regex-based tag stripper.
+
+    Args:
+        html_text: HTML string to convert.
+
+    Returns:
+        Plain text extracted from the HTML.
+    """
+    if BS4_AVAILABLE:
+        try:
+            soup = BeautifulSoup(html_text, 'html.parser')
+            # Remove script and style elements
+            for tag in soup(["script", "style"]):
+                tag.decompose()
+            text = soup.get_text(separator="\n")
+            # Collapse excessive blank lines
+            lines = [line.strip() for line in text.splitlines()]
+            return "\n".join(line for line in lines if line)
+        except Exception:
+            pass
+
+    # Regex fallback: strip tags, decode common entities
+    text = re.sub(r'<(script|style)[^>]*>.*?</\1>', '', html_text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+    text = text.replace('&quot;', '"').replace('&#39;', "'").replace('&nbsp;', ' ')
+    lines = [line.strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
 def extract_email_body(msg: Message) -> str:
     """
     Extract plain text body from an email message.
+
+    Prefers text/plain parts. Falls back to text/html (stripped of tags)
+    so that HTML-only emails do not produce empty bodies.
 
     Args:
         msg: Email message object.
@@ -1868,19 +1912,39 @@ def extract_email_body(msg: Message) -> str:
     """
     try:
         if msg.is_multipart():
+            plain_body = ""
+            html_body = ""
             for part in msg.walk():
                 content_type = part.get_content_type()
                 content_disposition = part.get("Content-Disposition")
 
-                if content_type == "text/plain" and not content_disposition:
-                    payload = part.get_payload(decode=True)
-                    if payload:
-                        return payload.decode("utf-8", errors='ignore')
+                # Skip attachments
+                if content_disposition:
+                    continue
+
+                payload = part.get_payload(decode=True)
+                if not payload:
+                    continue
+                decoded = payload.decode("utf-8", errors='ignore')
+
+                if content_type == "text/plain" and not plain_body:
+                    plain_body = decoded
+                elif content_type == "text/html" and not html_body:
+                    html_body = decoded
+
+            # Prefer plain text; fall back to stripped HTML
+            if plain_body:
+                return plain_body
+            if html_body:
+                return _strip_html(html_body)
             return ""
         else:
             payload = msg.get_payload(decode=True)
             if payload:
-                return payload.decode("utf-8", errors='ignore')
+                decoded = payload.decode("utf-8", errors='ignore')
+                if msg.get_content_type() == "text/html":
+                    return _strip_html(decoded)
+                return decoded
             return ""
     except Exception as e:
         logger.error(f"Failed to extract email body: {e}")
@@ -3041,6 +3105,17 @@ class NotificationDispatcher:
         def _should_send(channel_name: str) -> bool:
             return channel_decisions.get(channel_name, True)
 
+        # Resolve priority_override from matching rules (first non-empty wins)
+        priority_override = ""
+        if self.notification_rules.enabled:
+            matching_rules = self.notification_rules.get_matching_rules(
+                notification, source_type, severity
+            )
+            for rule in matching_rules:
+                if rule.priority_override:
+                    priority_override = rule.priority_override
+                    break
+
         # SMS via Twilio
         if self.twilio_sms.enabled and _should_send('sms'):
             sms_body = notification.truncate_for_sms(self.settings.max_sms_length)
@@ -3153,12 +3228,16 @@ class NotificationDispatcher:
 
         # Pushover
         if self.pushover.enabled and _should_send('pushover'):
+            # Apply priority_override from rules if present
+            po_priority = self.pushover.priority
+            if priority_override:
+                po_priority = safe_int(priority_override, po_priority, min_val=-2, max_val=2)
             result = send_pushover_notification(
                 self.pushover.api_token,
                 self.pushover.user_key,
                 notification.subject,
                 notification.body,
-                priority=self.pushover.priority,
+                priority=po_priority,
                 sound=self.pushover.sound,
                 device=self.pushover.device,
                 session=self.http_session,
@@ -3169,12 +3248,22 @@ class NotificationDispatcher:
 
         # Ntfy
         if self.ntfy.enabled and _should_send('ntfy'):
+            # Apply priority_override from rules if present.
+            # Ntfy accepts: min, low, default, high, urgent (or numeric 1-5).
+            ntfy_priority = self.ntfy.priority
+            if priority_override:
+                # Accept named priorities or numeric (mapped to names)
+                _ntfy_map = {'1': 'min', '2': 'low', '3': 'default', '4': 'high', '5': 'urgent'}
+                if priority_override in ('min', 'low', 'default', 'high', 'urgent'):
+                    ntfy_priority = priority_override
+                elif priority_override in _ntfy_map:
+                    ntfy_priority = _ntfy_map[priority_override]
             result = send_ntfy_notification(
                 self.ntfy.server_url,
                 self.ntfy.topic,
                 notification.subject,
                 notification.body,
-                priority=self.ntfy.priority,
+                priority=ntfy_priority,
                 tags=self.ntfy.tags,
                 auth_token=self.ntfy.auth_token,
                 session=self.http_session,
