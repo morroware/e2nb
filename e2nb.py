@@ -95,6 +95,7 @@ from e2nb_core import (
     FEEDPARSER_AVAILABLE,
     BS4_AVAILABLE,
     AIOSMTPD_AVAILABLE,
+    safe_int,
 )
 
 
@@ -1120,6 +1121,7 @@ class EmailMonitorApp:
         self.stop_event = threading.Event()
         self.log_queue: queue.Queue = queue.Queue()
         self.smtp_receiver: Optional[SmtpReceiver] = None
+        self._smtp_recv_dispatcher: Optional[NotificationDispatcher] = None
         self.current_page = "email"
         self.nav_items: Dict[str, SidebarItem] = {}
         self.pages: Dict[str, tk.Frame] = {}
@@ -1837,7 +1839,7 @@ class EmailMonitorApp:
     def _test_smtp_receiver_port(self):
         """Test if the SMTP receiver port is available."""
         host = self.smtp_recv_host.get() or '0.0.0.0'
-        port = int(self.smtp_recv_port.get() or 2525)
+        port = safe_int(self.smtp_recv_port.get(), 2525, min_val=1, max_val=65535)
 
         def test():
             success, msg = test_smtp_receiver_port(host, port)
@@ -2128,7 +2130,7 @@ class EmailMonitorApp:
         def test():
             cfg = SmtpConfig(
                 smtp_server=self.smtp_server.get(),
-                smtp_port=int(self.smtp_port.get() or 587),
+                smtp_port=safe_int(self.smtp_port.get(), 587, min_val=1, max_val=65535),
                 use_tls=self.smtp_tls_var.get(),
                 username=self.smtp_username.get(),
                 password=self.smtp_password.get(),
@@ -2693,9 +2695,9 @@ class EmailMonitorApp:
             cfg = EmailConfig(
                 protocol=proto.lower(),
                 imap_server=self.imap_server.get(),
-                imap_port=int(self.imap_port.get() or 993),
+                imap_port=safe_int(self.imap_port.get(), 993, min_val=1, max_val=65535),
                 pop3_server=self.pop3_server.get(),
-                pop3_port=int(self.pop3_port.get() or 995),
+                pop3_port=safe_int(self.pop3_port.get(), 995, min_val=1, max_val=65535),
                 username=self.username.get(),
                 password=self.password.get()
             )
@@ -2746,7 +2748,7 @@ class EmailMonitorApp:
             smtp_recv_config = SmtpReceiverConfig(
                 enabled=True,
                 host=self.smtp_recv_host.get() or '0.0.0.0',
-                port=int(self.smtp_recv_port.get() or 2525),
+                port=safe_int(self.smtp_recv_port.get(), 2525, min_val=1, max_val=65535),
                 use_auth=self.smtp_recv_auth_var.get(),
                 username=self.smtp_recv_username.get(),
                 password=self.smtp_recv_password.get(),
@@ -2756,10 +2758,12 @@ class EmailMonitorApp:
                     if f.strip()
                 ],
             )
-            dispatcher = NotificationDispatcher(self.config)
+            # Store dispatcher as instance variable to prevent premature garbage collection
+            # and allow proper cleanup when stopping
+            self._smtp_recv_dispatcher = NotificationDispatcher(self.config)
             self.smtp_receiver = SmtpReceiver(
                 config=smtp_recv_config,
-                callback=lambda notif: self._on_smtp_received(notif, dispatcher),
+                callback=lambda notif: self._on_smtp_received(notif, self._smtp_recv_dispatcher),
             )
             success, msg = self.smtp_receiver.start()
             if success:
@@ -2782,11 +2786,14 @@ class EmailMonitorApp:
         self.monitoring = False
         self.stop_event.set()
 
-        # Stop SMTP receiver
+        # Stop SMTP receiver and cleanup its dispatcher
         if self.smtp_receiver and self.smtp_receiver.is_running:
             self.smtp_receiver.stop()
             self.smtp_receiver = None
             self._log("SMTP receiver stopped", "INFO")
+        if hasattr(self, '_smtp_recv_dispatcher') and self._smtp_recv_dispatcher is not None:
+            self._smtp_recv_dispatcher.close()
+            self._smtp_recv_dispatcher = None
 
         self.start_btn.configure_state("normal")
         self.stop_btn.configure_state("disabled")
@@ -2821,7 +2828,7 @@ class EmailMonitorApp:
                 web_config = WebMonitorConfig.from_config(self.config)
                 http_config = HttpEndpointConfig.from_config(self.config)
 
-                interval = int(self.config.get('Settings', 'check_interval', fallback='60'))
+                interval = safe_int(self.config.get('Settings', 'check_interval', fallback='60'), DEFAULT_CHECK_INTERVAL, min_val=10, max_val=86400)
                 filters = [f.strip().lower() for f in self.config.get('Email', 'filter_emails', fallback='').split(',') if f.strip()]
 
                 self.root.after(0, lambda: self._update_status_bar(
@@ -2836,14 +2843,14 @@ class EmailMonitorApp:
                 protocol = self.config.get('Email', 'protocol', fallback='imap').lower()
                 tls_mode = self.config.get('Email', 'tls_mode', fallback=TLS_MODE_IMPLICIT)
                 verify_ssl = self.config.getboolean('Email', 'verify_ssl', fallback=True)
-                conn_timeout = int(self.config.get('Email', 'connection_timeout', fallback=str(DEFAULT_CONNECTION_TIMEOUT)))
-                max_emails = int(self.config.get('Email', 'max_emails_per_check', fallback='5'))
+                conn_timeout = safe_int(self.config.get('Email', 'connection_timeout', fallback=str(DEFAULT_CONNECTION_TIMEOUT)), DEFAULT_CONNECTION_TIMEOUT, min_val=5, max_val=300)
+                max_emails = safe_int(self.config.get('Email', 'max_emails_per_check', fallback='5'), 5, min_val=1, max_val=100)
                 pop3 = None
 
                 if email_username and protocol == 'imap':
                     imap = connect_to_imap(
                         self.config.get('Email', 'imap_server'),
-                        int(self.config.get('Email', 'imap_port', fallback='993')),
+                        safe_int(self.config.get('Email', 'imap_port', fallback='993'), DEFAULT_IMAP_PORT, min_val=1, max_val=65535),
                         email_username,
                         self.config.get('Email', 'password'),
                         timeout=conn_timeout,
@@ -2892,7 +2899,7 @@ class EmailMonitorApp:
                 elif email_username and protocol == 'pop3':
                     pop3 = connect_to_pop3(
                         self.config.get('Email', 'pop3_server'),
-                        int(self.config.get('Email', 'pop3_port', fallback='995')),
+                        safe_int(self.config.get('Email', 'pop3_port', fallback='995'), DEFAULT_POP3_PORT, min_val=1, max_val=65535),
                         email_username,
                         self.config.get('Email', 'password'),
                         timeout=conn_timeout,
@@ -3035,7 +3042,7 @@ class EmailMonitorApp:
                         pass
 
                 if not self.stop_event.is_set():
-                    interval = int(self.config.get('Settings', 'check_interval', fallback='60'))
+                    interval = safe_int(self.config.get('Settings', 'check_interval', fallback='60'), DEFAULT_CHECK_INTERVAL, min_val=10, max_val=86400)
                     self.stop_event.wait(interval)
 
     def _on_close(self):

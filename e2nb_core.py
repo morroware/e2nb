@@ -1080,10 +1080,24 @@ def connect_to_imap(
             imap = imaplib.IMAP4_SSL(server, port, timeout=timeout, ssl_context=ssl_context)
         elif tls_mode == TLS_MODE_EXPLICIT:
             # STARTTLS upgrade (typically port 143)
-            imap = imaplib.IMAP4(server, port, timeout=timeout)
+            # Note: IMAP4 timeout parameter requires Python 3.9+, so we set socket timeout after
+            import socket
+            old_timeout = socket.getdefaulttimeout()
+            try:
+                socket.setdefaulttimeout(timeout)
+                imap = imaplib.IMAP4(server, port)
+            finally:
+                socket.setdefaulttimeout(old_timeout)
             imap.starttls(ssl_context=ssl_context)
         else:  # TLS_MODE_NONE
-            imap = imaplib.IMAP4(server, port, timeout=timeout)
+            # Note: IMAP4 timeout parameter requires Python 3.9+, so we set socket timeout after
+            import socket
+            old_timeout = socket.getdefaulttimeout()
+            try:
+                socket.setdefaulttimeout(timeout)
+                imap = imaplib.IMAP4(server, port)
+            finally:
+                socket.setdefaulttimeout(old_timeout)
             logger.warning("Connecting to IMAP without TLS - connection is not encrypted")
 
         # Authenticate
@@ -1257,10 +1271,24 @@ def connect_to_pop3(
             pop3 = poplib.POP3_SSL(server, port, timeout=timeout, context=ssl_context)
         elif tls_mode == TLS_MODE_EXPLICIT:
             # STLS upgrade (typically port 110)
-            pop3 = poplib.POP3(server, port, timeout=timeout)
+            # Note: POP3 timeout parameter requires Python 3.9+, so we set socket timeout
+            import socket
+            old_timeout = socket.getdefaulttimeout()
+            try:
+                socket.setdefaulttimeout(timeout)
+                pop3 = poplib.POP3(server, port)
+            finally:
+                socket.setdefaulttimeout(old_timeout)
             pop3.stls(context=ssl_context)
         else:  # TLS_MODE_NONE
-            pop3 = poplib.POP3(server, port, timeout=timeout)
+            # Note: POP3 timeout parameter requires Python 3.9+, so we set socket timeout
+            import socket
+            old_timeout = socket.getdefaulttimeout()
+            try:
+                socket.setdefaulttimeout(timeout)
+                pop3 = poplib.POP3(server, port)
+            finally:
+                socket.setdefaulttimeout(old_timeout)
             logger.warning("Connecting to POP3 without TLS - connection is not encrypted")
 
         # Authenticate

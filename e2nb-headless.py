@@ -295,6 +295,7 @@ class EmailMonitorDaemon:
         while not self.stop_event.is_set():
             imap = None
             pop3 = None
+            check_interval = DEFAULT_CHECK_INTERVAL  # Default in case of early exception
             try:
                 # Get configuration values (thread-safe access)
                 with self._config_lock:
@@ -666,6 +667,11 @@ def test_configuration(config_file: str) -> bool:
     Returns:
         True if configuration is valid, False otherwise.
     """
+    def _cleanup(daemon):
+        """Clean up dispatcher resources."""
+        if daemon.dispatcher is not None:
+            daemon.dispatcher.close()
+
     print(f"Testing configuration from: {config_file}")
     print("-" * 50)
 
@@ -673,6 +679,7 @@ def test_configuration(config_file: str) -> bool:
 
     if not daemon.load_configuration():
         print("\nConfiguration test FAILED")
+        _cleanup(daemon)
         return False
 
     # Test IMAP connection (only if SMTP receiver is not the sole email source)
@@ -696,6 +703,7 @@ def test_configuration(config_file: str) -> bool:
                 print(f"  FAILED to connect to {email_config.pop3_server}:{email_config.pop3_port}")
                 if not smtp_recv_enabled:
                     print("\nConfiguration test FAILED")
+                    _cleanup(daemon)
                     return False
                 else:
                     print("  (SMTP receiver is enabled as alternative)")
@@ -714,12 +722,14 @@ def test_configuration(config_file: str) -> bool:
                 print(f"  FAILED to connect to {email_config.imap_server}:{email_config.imap_port}")
                 if not smtp_recv_enabled:
                     print("\nConfiguration test FAILED")
+                    _cleanup(daemon)
                     return False
                 else:
                     print("  (SMTP receiver is enabled as alternative)")
     elif not smtp_recv_enabled:
         print("\nNo email source configured (IMAP or SMTP Receiver)")
         print("\nConfiguration test FAILED")
+        _cleanup(daemon)
         return False
 
     # Show enabled notifications
@@ -763,6 +773,8 @@ def test_configuration(config_file: str) -> bool:
 
     print("\n" + "-" * 50)
     print("Configuration test PASSED")
+
+    _cleanup(daemon)
     return True
 
 
