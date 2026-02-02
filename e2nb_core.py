@@ -92,12 +92,20 @@ STATE_FILE_PATH = 'e2nb_state.json'
 DEFAULT_CHECK_INTERVAL = 60
 DEFAULT_MAX_SMS_LENGTH = 1600
 DEFAULT_IMAP_PORT = 993
+DEFAULT_IMAP_STARTTLS_PORT = 143
+DEFAULT_POP3_STARTTLS_PORT = 110
 MAX_EMAILS_PER_CHECK = 5
 DEFAULT_TIMEOUT = 30
+DEFAULT_CONNECTION_TIMEOUT = 30
 MAX_RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_FACTOR = 0.5
 DEFAULT_RSS_MAX_AGE_HOURS = 24
 DEFAULT_RSS_MAX_ITEMS = 10
+
+# TLS mode constants
+TLS_MODE_IMPLICIT = 'implicit'  # SSL connection from the start (port 993/995/465)
+TLS_MODE_EXPLICIT = 'explicit'  # STARTTLS/STLS upgrade (port 143/110/587)
+TLS_MODE_NONE = 'none'  # No encryption (not recommended)
 DEFAULT_WEB_CHECK_INTERVAL = 300
 
 # Logger setup
@@ -141,7 +149,7 @@ DEFAULT_POP3_PORT = 995
 
 @dataclass
 class EmailConfig:
-    """Email server configuration."""
+    """Email server configuration with advanced TLS and OAuth2 support."""
     protocol: str = "imap"  # 'imap' or 'pop3'
     imap_server: str = "imap.gmail.com"
     imap_port: int = DEFAULT_IMAP_PORT
@@ -150,6 +158,22 @@ class EmailConfig:
     username: str = ""
     password: str = ""
     filter_emails: List[str] = field(default_factory=list)
+
+    # TLS settings
+    tls_mode: str = TLS_MODE_IMPLICIT  # 'implicit', 'explicit', or 'none'
+    verify_ssl: bool = True
+    ca_bundle: str = ""  # Path to custom CA bundle, empty = system default
+
+    # OAuth2 settings (XOAUTH2)
+    oauth2_enabled: bool = False
+    oauth2_client_id: str = ""
+    oauth2_client_secret: str = ""
+    oauth2_refresh_token: str = ""
+    oauth2_token_url: str = ""  # e.g., https://oauth2.googleapis.com/token
+
+    # Connection settings
+    connection_timeout: int = DEFAULT_CONNECTION_TIMEOUT
+    max_emails_per_check: int = MAX_EMAILS_PER_CHECK
 
     @classmethod
     def from_config(cls, config: configparser.ConfigParser) -> 'EmailConfig':
@@ -165,7 +189,17 @@ class EmailConfig:
             pop3_port=int(section.get('pop3_port', str(DEFAULT_POP3_PORT))),
             username=section.get('username', ''),
             password=section.get('password', ''),
-            filter_emails=filters
+            filter_emails=filters,
+            tls_mode=section.get('tls_mode', TLS_MODE_IMPLICIT),
+            verify_ssl=section.getboolean('verify_ssl', fallback=True),
+            ca_bundle=section.get('ca_bundle', ''),
+            oauth2_enabled=section.getboolean('oauth2_enabled', fallback=False),
+            oauth2_client_id=section.get('oauth2_client_id', ''),
+            oauth2_client_secret=section.get('oauth2_client_secret', ''),
+            oauth2_refresh_token=section.get('oauth2_refresh_token', ''),
+            oauth2_token_url=section.get('oauth2_token_url', ''),
+            connection_timeout=int(section.get('connection_timeout', str(DEFAULT_CONNECTION_TIMEOUT))),
+            max_emails_per_check=int(section.get('max_emails_per_check', str(MAX_EMAILS_PER_CHECK))),
         )
 
 
@@ -845,6 +879,94 @@ def setup_logging(
 
 
 # =============================================================================
+# OAuth2 Support (XOAUTH2)
+# =============================================================================
+
+def refresh_oauth2_token(
+    client_id: str,
+    client_secret: str,
+    refresh_token: str,
+    token_url: str = "https://oauth2.googleapis.com/token"
+) -> Tuple[bool, str, str]:
+    """
+    Refresh an OAuth2 access token using a refresh token.
+
+    Args:
+        client_id: OAuth2 client ID.
+        client_secret: OAuth2 client secret.
+        refresh_token: OAuth2 refresh token.
+        token_url: Token endpoint URL.
+
+    Returns:
+        Tuple of (success, access_token, error_message).
+    """
+    try:
+        response = requests.post(token_url, data={
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'refresh_token': refresh_token,
+            'grant_type': 'refresh_token'
+        }, timeout=DEFAULT_TIMEOUT)
+
+        if response.status_code == 200:
+            data = response.json()
+            access_token = data.get('access_token', '')
+            if access_token:
+                logger.debug("OAuth2 token refreshed successfully")
+                return True, access_token, ""
+            return False, "", "No access token in response"
+        else:
+            error = response.json().get('error_description', response.text)
+            logger.error(f"OAuth2 token refresh failed: {error}")
+            return False, "", error
+    except Exception as e:
+        logger.error(f"OAuth2 token refresh error: {e}")
+        return False, "", str(e)
+
+
+def generate_xoauth2_string(username: str, access_token: str) -> str:
+    """
+    Generate XOAUTH2 authentication string.
+
+    Args:
+        username: Email address.
+        access_token: OAuth2 access token.
+
+    Returns:
+        Base64-encoded XOAUTH2 string.
+    """
+    import base64
+    auth_string = f"user={username}\x01auth=Bearer {access_token}\x01\x01"
+    return base64.b64encode(auth_string.encode()).decode()
+
+
+def create_ssl_context(
+    verify_ssl: bool = True,
+    ca_bundle: str = ""
+) -> ssl.SSLContext:
+    """
+    Create an SSL context with custom verification settings.
+
+    Args:
+        verify_ssl: Whether to verify SSL certificates.
+        ca_bundle: Path to custom CA bundle file.
+
+    Returns:
+        Configured SSL context.
+    """
+    if verify_ssl:
+        context = ssl.create_default_context()
+        if ca_bundle and os.path.exists(ca_bundle):
+            context.load_verify_locations(ca_bundle)
+    else:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        logger.warning("SSL verification disabled - connections may be insecure")
+    return context
+
+
+# =============================================================================
 # Email Operations
 # =============================================================================
 
@@ -853,25 +975,54 @@ def connect_to_imap(
     port: int,
     username: str,
     password: str,
-    timeout: int = DEFAULT_TIMEOUT
+    timeout: int = DEFAULT_TIMEOUT,
+    tls_mode: str = TLS_MODE_IMPLICIT,
+    verify_ssl: bool = True,
+    ca_bundle: str = "",
+    oauth2_access_token: str = ""
 ) -> Optional[imaplib.IMAP4_SSL]:
     """
-    Establish a secure connection to an IMAP server.
+    Establish a connection to an IMAP server with flexible TLS and auth options.
 
     Args:
         server: IMAP server address.
         port: IMAP server port.
         username: Email username.
-        password: Email password.
+        password: Email password (or empty if using OAuth2).
         timeout: Connection timeout in seconds.
+        tls_mode: TLS mode ('implicit', 'explicit', or 'none').
+        verify_ssl: Whether to verify SSL certificates.
+        ca_bundle: Path to custom CA bundle.
+        oauth2_access_token: OAuth2 access token for XOAUTH2 auth.
 
     Returns:
         Authenticated IMAP connection or None on failure.
     """
     try:
-        imap = imaplib.IMAP4_SSL(server, port, timeout=timeout)
-        imap.login(username, password)
-        logger.info(f"Connected to IMAP server {server}:{port}")
+        ssl_context = create_ssl_context(verify_ssl, ca_bundle)
+
+        if tls_mode == TLS_MODE_IMPLICIT:
+            # SSL connection from the start (typically port 993)
+            imap = imaplib.IMAP4_SSL(server, port, timeout=timeout, ssl_context=ssl_context)
+        elif tls_mode == TLS_MODE_EXPLICIT:
+            # STARTTLS upgrade (typically port 143)
+            imap = imaplib.IMAP4(server, port, timeout=timeout)
+            imap.starttls(ssl_context=ssl_context)
+        else:  # TLS_MODE_NONE
+            imap = imaplib.IMAP4(server, port, timeout=timeout)
+            logger.warning("Connecting to IMAP without TLS - connection is not encrypted")
+
+        # Authenticate
+        if oauth2_access_token:
+            # XOAUTH2 authentication
+            auth_string = generate_xoauth2_string(username, oauth2_access_token)
+            imap.authenticate('XOAUTH2', lambda x: auth_string.encode())
+            logger.info(f"Connected to IMAP server {server}:{port} using OAuth2")
+        else:
+            # Standard login
+            imap.login(username, password)
+            logger.info(f"Connected to IMAP server {server}:{port}")
+
         return imap
     except imaplib.IMAP4.error as e:
         logger.error(f"IMAP authentication failed for {server}:{port}: {e}")
@@ -929,31 +1080,134 @@ def fetch_unread_emails(
         return []
 
 
+def fetch_unread_emails_by_uid(
+    imap: imaplib.IMAP4_SSL,
+    max_emails: int = MAX_EMAILS_PER_CHECK,
+    last_seen_uid: int = 0
+) -> Tuple[List[Tuple[int, Message]], int]:
+    """
+    Retrieve unread emails using UID for persistent tracking across sessions.
+
+    UIDs are persistent across sessions (unlike sequence numbers), making this
+    suitable for avoiding re-processing emails across restarts or expunges.
+
+    Args:
+        imap: Authenticated IMAP connection.
+        max_emails: Maximum number of emails to fetch.
+        last_seen_uid: Only fetch emails with UID > this value.
+
+    Returns:
+        Tuple of (list of (uid, message) tuples, highest_uid_seen).
+    """
+    try:
+        imap.select("inbox")
+
+        # Search for unseen emails with UID greater than last seen
+        if last_seen_uid > 0:
+            # UID SEARCH for unseen messages with UID > last_seen_uid
+            status, messages = imap.uid('search', None, f'UNSEEN UID {last_seen_uid + 1}:*')
+        else:
+            status, messages = imap.uid('search', None, 'UNSEEN')
+
+        if status != "OK":
+            logger.info("No unread emails found.")
+            return [], last_seen_uid
+
+        uid_list = messages[0].split()
+        if not uid_list:
+            logger.debug("Inbox UID search returned empty results.")
+            return [], last_seen_uid
+
+        # Convert to integers and filter out UIDs <= last_seen_uid
+        uids = [int(uid) for uid in uid_list if int(uid) > last_seen_uid]
+
+        if not uids:
+            return [], last_seen_uid
+
+        # Sort descending (most recent first) and limit
+        uids = sorted(uids, reverse=True)[:max_emails]
+
+        emails = []
+        highest_uid = last_seen_uid
+
+        for uid in uids:
+            try:
+                res, msg_data = imap.uid('fetch', str(uid), '(RFC822)')
+                for response in msg_data:
+                    if isinstance(response, tuple):
+                        msg = email_module.message_from_bytes(response[1])
+                        emails.append((uid, msg))
+                        highest_uid = max(highest_uid, uid)
+            except Exception as e:
+                logger.error(f"Failed to fetch email UID {uid}: {e}")
+
+        return emails, highest_uid
+    except Exception as e:
+        logger.error(f"Failed to fetch emails by UID: {e}")
+        return [], last_seen_uid
+
+
 def connect_to_pop3(
     server: str,
     port: int,
     username: str,
     password: str,
-    timeout: int = DEFAULT_TIMEOUT
+    timeout: int = DEFAULT_TIMEOUT,
+    tls_mode: str = TLS_MODE_IMPLICIT,
+    verify_ssl: bool = True,
+    ca_bundle: str = "",
+    oauth2_access_token: str = ""
 ) -> Optional[poplib.POP3_SSL]:
     """
-    Establish a secure connection to a POP3 server.
+    Establish a connection to a POP3 server with flexible TLS and auth options.
 
     Args:
         server: POP3 server address.
         port: POP3 server port.
         username: Email username.
-        password: Email password.
+        password: Email password (or empty if using OAuth2).
         timeout: Connection timeout in seconds.
+        tls_mode: TLS mode ('implicit', 'explicit', or 'none').
+        verify_ssl: Whether to verify SSL certificates.
+        ca_bundle: Path to custom CA bundle.
+        oauth2_access_token: OAuth2 access token for XOAUTH2 auth.
 
     Returns:
         Authenticated POP3 connection or None on failure.
     """
     try:
-        pop3 = poplib.POP3_SSL(server, port, timeout=timeout)
-        pop3.user(username)
-        pop3.pass_(password)
-        logger.info(f"Connected to POP3 server {server}:{port}")
+        ssl_context = create_ssl_context(verify_ssl, ca_bundle)
+
+        if tls_mode == TLS_MODE_IMPLICIT:
+            # SSL connection from the start (typically port 995)
+            pop3 = poplib.POP3_SSL(server, port, timeout=timeout, context=ssl_context)
+        elif tls_mode == TLS_MODE_EXPLICIT:
+            # STLS upgrade (typically port 110)
+            pop3 = poplib.POP3(server, port, timeout=timeout)
+            pop3.stls(context=ssl_context)
+        else:  # TLS_MODE_NONE
+            pop3 = poplib.POP3(server, port, timeout=timeout)
+            logger.warning("Connecting to POP3 without TLS - connection is not encrypted")
+
+        # Authenticate
+        if oauth2_access_token:
+            # XOAUTH2 authentication for POP3
+            # Note: Not all POP3 servers support XOAUTH2
+            auth_string = generate_xoauth2_string(username, oauth2_access_token)
+            try:
+                pop3._shortcmd(f'AUTH XOAUTH2 {auth_string}')
+                logger.info(f"Connected to POP3 server {server}:{port} using OAuth2")
+            except poplib.error_proto:
+                # Fallback: some servers need USER/PASS style with OAuth2
+                logger.warning("XOAUTH2 not supported, OAuth2 may not work with this POP3 server")
+                pop3.user(username)
+                pop3.pass_(password)
+        else:
+            # Standard login
+            pop3.user(username)
+            pop3.pass_(password)
+            logger.info(f"Connected to POP3 server {server}:{port}")
+
         return pop3
     except poplib.error_proto as e:
         logger.error(f"POP3 authentication failed for {server}:{port}: {e}")
@@ -1345,8 +1599,11 @@ def send_slack_message(
     if not token or not channel:
         return NotificationResult(False, "Slack", "Token or channel not configured")
 
-    # Ensure channel has # prefix
-    if not channel.startswith('#'):
+    # Handle channel format:
+    # - Channel IDs start with C (public) or G (private/group) - use as-is
+    # - Channel names should have # prefix added
+    channel = channel.strip()
+    if not (channel.startswith('C') or channel.startswith('G')) and not channel.startswith('#'):
         channel = f'#{channel}'
 
     try:
@@ -1371,15 +1628,35 @@ def send_slack_message(
         return NotificationResult(False, "Slack", str(e))
 
 
+def escape_telegram_markdown_v2(text: str) -> str:
+    """
+    Escape special characters for Telegram MarkdownV2 format.
+
+    Characters that must be escaped: _ * [ ] ( ) ~ ` > # + - = | { } . !
+
+    Args:
+        text: Text to escape.
+
+    Returns:
+        Escaped text safe for MarkdownV2.
+    """
+    # Characters that need escaping in MarkdownV2
+    special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    for char in special_chars:
+        text = text.replace(char, f'\\{char}')
+    return text
+
+
 def send_telegram_message(
     bot_token: str,
     chat_id: str,
     subject: str,
     body: str,
-    session: Optional[requests.Session] = None
+    session: Optional[requests.Session] = None,
+    use_markdown_v2: bool = True
 ) -> NotificationResult:
     """
-    Send a message to a Telegram chat.
+    Send a message to a Telegram chat with proper Markdown escaping.
 
     Args:
         bot_token: Telegram bot token.
@@ -1387,6 +1664,7 @@ def send_telegram_message(
         subject: Message subject.
         body: Message body.
         session: Optional requests session for connection pooling.
+        use_markdown_v2: Use MarkdownV2 with proper escaping (default True).
 
     Returns:
         NotificationResult with success status.
@@ -1395,16 +1673,28 @@ def send_telegram_message(
         return NotificationResult(False, "Telegram", "Bot token or chat ID not configured")
 
     try:
-        message = f"*{subject}*\n{body}"
+        if use_markdown_v2:
+            # Escape special characters for MarkdownV2
+            escaped_subject = escape_telegram_markdown_v2(subject)
+            escaped_body = escape_telegram_markdown_v2(body)
+            message = f"*{escaped_subject}*\n{escaped_body}"
+            parse_mode = 'MarkdownV2'
+        else:
+            # Plain text fallback (no escaping needed)
+            message = f"{subject}\n{body}"
+            parse_mode = None
+
         # Telegram message limit is 4096 characters
         if len(message) > 4096:
             message = message[:4093] + "..."
+
         url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
         params = {
             'chat_id': chat_id,
             'text': message,
-            'parse_mode': 'Markdown'
         }
+        if parse_mode:
+            params['parse_mode'] = parse_mode
 
         http_session = session or create_http_session()
         response = http_session.post(url, data=params, timeout=DEFAULT_TIMEOUT)
@@ -1413,6 +1703,12 @@ def send_telegram_message(
             logger.info("Sent Telegram message")
             return NotificationResult(True, "Telegram", "Message sent")
         else:
+            # If MarkdownV2 fails, try plain text as fallback
+            if use_markdown_v2:
+                logger.warning("MarkdownV2 failed, retrying with plain text")
+                return send_telegram_message(
+                    bot_token, chat_id, subject, body, session, use_markdown_v2=False
+                )
             error_msg = f"HTTP {response.status_code}: {response.text}"
             logger.error(f"Failed to send Telegram message: {error_msg}")
             return NotificationResult(False, "Telegram", error_msg)
@@ -1467,15 +1763,19 @@ def send_discord_message(
 def send_custom_webhook(
     webhook_url: str,
     payload: Dict[str, Any],
-    session: Optional[requests.Session] = None
+    session: Optional[requests.Session] = None,
+    max_retries: int = 3,
+    retry_on_post: bool = True
 ) -> NotificationResult:
     """
-    Send a payload to a custom webhook.
+    Send a payload to a custom webhook with retry support.
 
     Args:
         webhook_url: Webhook URL.
         payload: Data to send.
         session: Optional requests session for connection pooling.
+        max_retries: Maximum number of retry attempts.
+        retry_on_post: Whether to retry POST requests (safe if endpoint is idempotent).
 
     Returns:
         NotificationResult with success status.
@@ -1483,20 +1783,61 @@ def send_custom_webhook(
     if not validate_url(webhook_url):
         return NotificationResult(False, "Webhook", "Invalid webhook URL")
 
-    try:
+    # Create session with retry capability for POST if enabled
+    if retry_on_post and session is None:
+        retry_strategy = Retry(
+            total=max_retries,
+            backoff_factor=RETRY_BACKOFF_FACTOR,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]  # Include POST
+        )
+        http_session = requests.Session()
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        http_session.mount("https://", adapter)
+        http_session.mount("http://", adapter)
+    else:
         http_session = session or create_http_session()
-        response = http_session.post(webhook_url, json=payload, timeout=DEFAULT_TIMEOUT)
 
-        if response.status_code in [200, 201, 202, 204]:
-            logger.info("Sent custom webhook")
-            return NotificationResult(True, "Webhook", "Payload delivered")
-        else:
-            error_msg = f"HTTP {response.status_code}: {response.text}"
-            logger.error(f"Failed to send custom webhook: {error_msg}")
-            return NotificationResult(False, "Webhook", error_msg)
-    except Exception as e:
-        logger.error(f"Failed to send custom webhook: {e}")
-        return NotificationResult(False, "Webhook", str(e))
+    last_error = ""
+    for attempt in range(max_retries + 1):
+        try:
+            response = http_session.post(webhook_url, json=payload, timeout=DEFAULT_TIMEOUT)
+
+            if response.status_code in [200, 201, 202, 204]:
+                logger.info("Sent custom webhook")
+                return NotificationResult(True, "Webhook", "Payload delivered")
+            elif response.status_code in [429, 500, 502, 503, 504] and attempt < max_retries:
+                # Retryable error
+                wait_time = (2 ** attempt) * RETRY_BACKOFF_FACTOR
+                logger.warning(f"Webhook returned {response.status_code}, retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                last_error = f"HTTP {response.status_code}"
+                continue
+            else:
+                last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+                logger.error(f"Failed to send custom webhook: {last_error}")
+                return NotificationResult(False, "Webhook", last_error)
+
+        except requests.exceptions.Timeout:
+            last_error = "Request timed out"
+            if attempt < max_retries:
+                wait_time = (2 ** attempt) * RETRY_BACKOFF_FACTOR
+                logger.warning(f"Webhook timed out, retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+        except requests.exceptions.ConnectionError as e:
+            last_error = f"Connection error: {e}"
+            if attempt < max_retries:
+                wait_time = (2 ** attempt) * RETRY_BACKOFF_FACTOR
+                logger.warning(f"Webhook connection error, retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+        except Exception as e:
+            last_error = str(e)
+            logger.error(f"Failed to send custom webhook: {e}")
+            break
+
+    return NotificationResult(False, "Webhook", last_error)
 
 
 def send_email_notification(
@@ -1906,6 +2247,7 @@ class MonitorState:
         self._state: Dict[str, Any] = {
             'seen_rss_items': {},  # feed_url -> set of item IDs
             'seen_pop3_messages': set(),  # set of message hashes for POP3
+            'imap_last_uid': {},  # server:username -> last seen UID
             'web_page_hashes': {},  # page_url -> content hash
             'http_endpoint_status': {},  # endpoint_url -> last status
             'last_updated': None
@@ -1980,6 +2322,18 @@ class MonitorState:
                 # Convert to list, keep recent items, convert back to set
                 items_list = list(items)
                 self._state['seen_pop3_messages'] = set(items_list[-max_items:])
+
+    def get_imap_last_uid(self, server: str, username: str) -> int:
+        """Get the last seen IMAP UID for persistent tracking."""
+        key = f"{server}:{username}"
+        return self._state.get('imap_last_uid', {}).get(key, 0)
+
+    def set_imap_last_uid(self, server: str, username: str, uid: int):
+        """Set the last seen IMAP UID."""
+        if 'imap_last_uid' not in self._state:
+            self._state['imap_last_uid'] = {}
+        key = f"{server}:{username}"
+        self._state['imap_last_uid'][key] = uid
 
     def get_web_page_hash(self, url: str) -> Optional[str]:
         """Get stored hash for a web page."""
