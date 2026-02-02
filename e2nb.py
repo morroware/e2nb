@@ -40,12 +40,13 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+import json
 import queue
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 from datetime import datetime
-from typing import Optional, Dict, Callable, List
+from typing import Optional, Dict, Callable, List, Any
 
 # Import shared core module
 from e2nb_core import (
@@ -62,10 +63,24 @@ from e2nb_core import (
     EmailNotification,
     NotificationDispatcher,
     EmailConfig,
+    SmtpConfig,
+    RssFeedConfig,
+    WebMonitorConfig,
+    HttpEndpointConfig,
+    MonitorState,
+    MonitorEvent,
     test_imap_connection,
+    test_smtp_connection,
+    test_rss_feed,
+    test_http_endpoint,
+    check_rss_feeds,
+    check_web_pages,
+    check_http_endpoints,
     DEFAULT_CHECK_INTERVAL,
     DEFAULT_MAX_SMS_LENGTH,
     DEFAULT_IMAP_PORT,
+    FEEDPARSER_AVAILABLE,
+    BS4_AVAILABLE,
 )
 
 
@@ -1054,6 +1069,10 @@ class EmailMonitorApp:
         "telegram": ("Telegram",         "Notifications"),
         "discord":  ("Discord",          "Notifications"),
         "webhook":  ("Custom Webhook",   "Notifications"),
+        "smtp":     ("Email (SMTP)",     "Notifications"),
+        "rss":      ("RSS Feeds",        "Sources"),
+        "webmon":   ("Web Pages",        "Sources"),
+        "httpmon":  ("HTTP Endpoints",   "Sources"),
         "logs":     ("Activity Logs",    "Monitor"),
     }
 
@@ -1115,6 +1134,7 @@ class EmailMonitorApp:
 
     def _init_variables(self):
         """Initialize tkinter variables."""
+        # Notification channels
         self.twilio_sms_var = tk.BooleanVar(value=self.config.getboolean('Twilio', 'enabled', fallback=False))
         self.voice_var = tk.BooleanVar(value=self.config.getboolean('Voice', 'enabled', fallback=False))
         self.whatsapp_var = tk.BooleanVar(value=self.config.getboolean('WhatsApp', 'enabled', fallback=False))
@@ -1122,6 +1142,14 @@ class EmailMonitorApp:
         self.telegram_var = tk.BooleanVar(value=self.config.getboolean('Telegram', 'enabled', fallback=False))
         self.discord_var = tk.BooleanVar(value=self.config.getboolean('Discord', 'enabled', fallback=False))
         self.webhook_var = tk.BooleanVar(value=self.config.getboolean('CustomWebhook', 'enabled', fallback=False))
+        self.smtp_var = tk.BooleanVar(value=self.config.getboolean('SMTP', 'enabled', fallback=False))
+
+        # Monitoring sources
+        self.rss_var = tk.BooleanVar(value=self.config.getboolean('RSS', 'enabled', fallback=False))
+        self.webmon_var = tk.BooleanVar(value=self.config.getboolean('WebMonitor', 'enabled', fallback=False))
+        self.httpmon_var = tk.BooleanVar(value=self.config.getboolean('HttpMonitor', 'enabled', fallback=False))
+
+        # Other
         self.auto_scroll_var = tk.BooleanVar(value=True)
         self.show_password_var = tk.BooleanVar(value=False)
 
@@ -1129,17 +1157,29 @@ class EmailMonitorApp:
         for var in self._service_vars():
             var.trace_add("write", lambda *a: self._update_services_badge())
 
+        # Track changes to source toggles
+        for var in self._source_vars():
+            var.trace_add("write", lambda *a: self._update_sources_badge())
+
     def _service_vars(self) -> list:
         return [
             self.twilio_sms_var, self.voice_var, self.whatsapp_var,
             self.slack_var, self.telegram_var, self.discord_var,
-            self.webhook_var,
+            self.webhook_var, self.smtp_var,
         ]
+
+    def _source_vars(self) -> list:
+        return [self.rss_var, self.webmon_var, self.httpmon_var]
 
     def _update_services_badge(self):
         if hasattr(self, '_services_badge'):
             count = sum(1 for v in self._service_vars() if v.get())
-            self._services_badge.update_count(count)
+            self._services_badge.update_count(count, total=8)
+
+    def _update_sources_badge(self):
+        if hasattr(self, '_sources_badge'):
+            count = sum(1 for v in self._source_vars() if v.get())
+            self._sources_badge.update_count(count, total=3)
 
     def _create_layout(self):
         """Create the main layout structure."""
@@ -1248,6 +1288,7 @@ class EmailMonitorApp:
             ("telegram", "Telegram", 0, self.telegram_var, "Telegram bot messages"),
             ("discord", "Discord", 0, self.discord_var, "Discord webhook notifications"),
             ("webhook", "Webhook", 0, self.webhook_var, "Custom HTTP webhook"),
+            ("smtp", "Email (SMTP)", 0, self.smtp_var, "Email notifications via SMTP"),
         ]
         for key, text, indent, var, tip in notification_items:
             item = SidebarItem(
@@ -1260,6 +1301,26 @@ class EmailMonitorApp:
         # Services badge
         self._services_badge = SidebarBadge(nav)
         self._services_badge.pack(fill="x", pady=(4, 0))
+
+        # Sources section (additional monitoring sources)
+        SidebarSection(nav, "Sources").pack(fill="x")
+
+        source_items = [
+            ("rss", "RSS Feeds", 0, self.rss_var, "Monitor RSS/Atom feeds for new items"),
+            ("webmon", "Web Pages", 0, self.webmon_var, "Detect changes on web pages"),
+            ("httpmon", "HTTP Endpoints", 0, self.httpmon_var, "Monitor API/service availability"),
+        ]
+        for key, text, indent, var, tip in source_items:
+            item = SidebarItem(
+                nav, text, lambda k=key: self._show_page(k),
+                indent, status_var=var, tooltip=tip,
+            )
+            item.pack(fill="x")
+            self.nav_items[key] = item
+
+        # Sources badge
+        self._sources_badge = SidebarBadge(nav)
+        self._sources_badge.pack(fill="x", pady=(4, 0))
 
         # Monitor section
         SidebarSection(nav, "Monitor").pack(fill="x")
@@ -1385,6 +1446,10 @@ class EmailMonitorApp:
         self._create_telegram_page()
         self._create_discord_page()
         self._create_webhook_page()
+        self._create_smtp_page()
+        self._create_rss_page()
+        self._create_webmon_page()
+        self._create_httpmon_page()
         self._create_logs_page()
 
     def _create_scrollable_page(self, name: str) -> tk.Frame:
@@ -1658,6 +1723,442 @@ class EmailMonitorApp:
         self.webhook_url = rows["webhook_url"]
         self.webhook_url.set(self.config.get('CustomWebhook', 'webhook_url', fallback=''))
 
+    def _create_smtp_page(self):
+        page = self._create_scrollable_page("smtp")
+
+        # Enable toggle
+        toggle_frame = tk.Frame(
+            page, bg=Theme.BG_PRIMARY,
+            highlightbackground=Theme.CARD_BORDER, highlightthickness=1,
+        )
+        toggle_frame.pack(fill="x", pady=(0, 24))
+        ToggleSwitch(toggle_frame, "Enable Email Notifications", self.smtp_var).pack(fill="x")
+
+        # Server settings
+        section1 = FormSection(page, "SMTP Server", "Configure your outgoing mail server")
+        section1.pack(fill="x", pady=(0, 24))
+
+        self.smtp_server = FormRow(
+            section1.content, "Server", "e.g., smtp.gmail.com",
+            tooltip="SMTP server hostname for sending emails",
+        )
+        self.smtp_server.pack(fill="x")
+        self.smtp_server.set(self.config.get('SMTP', 'smtp_server', fallback='smtp.gmail.com'))
+
+        self._create_separator(section1.content)
+
+        self.smtp_port = FormRow(
+            section1.content, "Port", "587 (TLS) or 465 (SSL)",
+            tooltip="SMTP port (587 for STARTTLS, 465 for SSL)",
+        )
+        self.smtp_port.pack(fill="x")
+        self.smtp_port.set(self.config.get('SMTP', 'smtp_port', fallback='587'))
+
+        self._create_separator(section1.content)
+
+        # TLS toggle
+        self.smtp_tls_var = tk.BooleanVar(value=self.config.getboolean('SMTP', 'use_tls', fallback=True))
+        tls_frame = tk.Frame(section1.content, bg=Theme.BG_PRIMARY)
+        tls_frame.pack(fill="x")
+        ToggleSwitch(tls_frame, "Use TLS Encryption", self.smtp_tls_var).pack(fill="x")
+
+        # Credentials
+        section2 = FormSection(page, "Credentials", "SMTP authentication details")
+        section2.pack(fill="x", pady=(0, 24))
+
+        self.smtp_username = FormRow(
+            section2.content, "Username", "Your email address",
+            tooltip="Username for SMTP authentication (usually your email)",
+        )
+        self.smtp_username.pack(fill="x")
+        self.smtp_username.set(self.config.get('SMTP', 'username', fallback=''))
+
+        self._create_separator(section2.content)
+
+        self.smtp_password = FormRow(
+            section2.content, "Password", "App password if 2FA enabled", show="*",
+            tooltip="Password for SMTP authentication",
+        )
+        self.smtp_password.pack(fill="x")
+        self.smtp_password.set(self.config.get('SMTP', 'password', fallback=''))
+
+        # Test button
+        btn_frame = tk.Frame(page, bg=Theme.BG_SECONDARY)
+        btn_frame.pack(fill="x", pady=(0, 24))
+
+        ModernButton(
+            btn_frame, text="Test Connection",
+            command=self._test_smtp_connection,
+            bg=Theme.BG_PRIMARY, fg=Theme.TEXT_PRIMARY,
+            hover_bg=Theme.BG_TERTIARY,
+            tooltip="Verify SMTP server connection",
+        ).pack(side="left")
+
+        # Email settings
+        section3 = FormSection(page, "Email Settings", "Configure sender and recipients")
+        section3.pack(fill="x", pady=(0, 24))
+
+        self.smtp_from = FormRow(
+            section3.content, "From Address", "notifications@example.com",
+            tooltip="Email address to send notifications from",
+        )
+        self.smtp_from.pack(fill="x")
+        self.smtp_from.set(self.config.get('SMTP', 'from_address', fallback=''))
+
+        self._create_separator(section3.content)
+
+        self.smtp_to = FormRow(
+            section3.content, "To Address(es)", "Comma-separated",
+            tooltip="Email addresses to receive notifications",
+        )
+        self.smtp_to.pack(fill="x")
+        self.smtp_to.set(self.config.get('SMTP', 'to_addresses', fallback=''))
+
+        self._create_separator(section3.content)
+
+        self.smtp_prefix = FormRow(
+            section3.content, "Subject Prefix", "[E2NB]",
+            tooltip="Prefix added to notification email subjects",
+        )
+        self.smtp_prefix.pack(fill="x")
+        self.smtp_prefix.set(self.config.get('SMTP', 'subject_prefix', fallback='[E2NB]'))
+
+    def _test_smtp_connection(self):
+        """Test SMTP connection with current settings."""
+        self._log("Testing SMTP connection...", "INFO")
+        self._update_status_bar("Testing SMTP connection...")
+
+        def test():
+            cfg = SmtpConfig(
+                smtp_server=self.smtp_server.get(),
+                smtp_port=int(self.smtp_port.get() or 587),
+                use_tls=self.smtp_tls_var.get(),
+                username=self.smtp_username.get(),
+                password=self.smtp_password.get(),
+                from_address=self.smtp_from.get(),
+                to_addresses=[],
+                subject_prefix=self.smtp_prefix.get()
+            )
+            success, msg = test_smtp_connection(cfg)
+            self.root.after(0, lambda: self._on_smtp_test_result(success, msg))
+
+        threading.Thread(target=test, daemon=True).start()
+
+    def _on_smtp_test_result(self, success: bool, message: str):
+        """Handle SMTP connection test result."""
+        if success:
+            self._log(message, "SUCCESS")
+            self.toast.show(message, "success")
+            self._update_status_bar("SMTP connection test passed")
+        else:
+            self._log(f"SMTP test failed: {message}", "ERROR")
+            self.toast.show(f"SMTP connection failed: {message}", "error")
+            self._update_status_bar("SMTP connection test failed")
+
+    # =========================================================================
+    # Monitoring Source Pages
+    # =========================================================================
+
+    def _create_rss_page(self):
+        """Create RSS feed monitoring configuration page."""
+        page = self._create_scrollable_page("rss")
+
+        # Enable toggle
+        toggle_frame = tk.Frame(
+            page, bg=Theme.BG_PRIMARY,
+            highlightbackground=Theme.CARD_BORDER, highlightthickness=1,
+        )
+        toggle_frame.pack(fill="x", pady=(0, 24))
+        ToggleSwitch(toggle_frame, "Enable RSS Feed Monitoring", self.rss_var).pack(fill="x")
+
+        # Library status
+        if not FEEDPARSER_AVAILABLE:
+            warning_frame = tk.Frame(page, bg=Theme.WARNING_LIGHT)
+            warning_frame.pack(fill="x", pady=(0, 24))
+            tk.Label(
+                warning_frame, text="feedparser library not installed. Run: pip install feedparser",
+                bg=Theme.WARNING_LIGHT, fg=Theme.TEXT_PRIMARY, font=(Theme.FONT, 9),
+                padx=16, pady=12,
+            ).pack(fill="x")
+
+        # Settings
+        section1 = FormSection(page, "RSS Settings", "Configure feed monitoring behavior")
+        section1.pack(fill="x", pady=(0, 24))
+
+        self.rss_interval = FormRow(
+            section1.content, "Check Interval", "Seconds between checks (default: 300)",
+            tooltip="How often to check feeds for new items",
+        )
+        self.rss_interval.pack(fill="x")
+        self.rss_interval.set(self.config.get('RSS', 'check_interval', fallback='300'))
+
+        self._create_separator(section1.content)
+
+        self.rss_max_age = FormRow(
+            section1.content, "Max Age (hours)", "Ignore items older than this",
+            tooltip="Only process items published within this many hours",
+        )
+        self.rss_max_age.pack(fill="x")
+        self.rss_max_age.set(self.config.get('RSS', 'max_age_hours', fallback='24'))
+
+        # Feeds list
+        section2 = FormSection(page, "RSS Feeds", "Add feeds to monitor (JSON format)")
+        section2.pack(fill="x", pady=(0, 24))
+
+        # JSON editor for feeds
+        feeds_frame = tk.Frame(section2.content, bg=Theme.BG_PRIMARY)
+        feeds_frame.pack(fill="x", padx=16, pady=12)
+
+        tk.Label(
+            feeds_frame,
+            text='Enter feeds as JSON array. Example:\n[{"name": "Tech News", "url": "https://example.com/feed.xml", "keywords": ["python", "ai"]}]',
+            bg=Theme.BG_PRIMARY, fg=Theme.TEXT_MUTED, font=(Theme.FONT, 9),
+            justify="left", anchor="w",
+        ).pack(fill="x", pady=(0, 8))
+
+        self.rss_feeds_text = scrolledtext.ScrolledText(
+            feeds_frame, height=6, font=(Theme.FONT_MONO, 9),
+            bg=Theme.BG_INPUT, fg=Theme.TEXT_PRIMARY,
+            insertbackground=Theme.PRIMARY, wrap="word",
+        )
+        self.rss_feeds_text.pack(fill="x")
+        self.rss_feeds_text.insert("1.0", self.config.get('RSS', 'feeds', fallback='[]'))
+
+        # Test button
+        btn_frame = tk.Frame(page, bg=Theme.BG_SECONDARY)
+        btn_frame.pack(fill="x", pady=(0, 24))
+
+        ModernButton(
+            btn_frame, text="Validate Feeds",
+            command=self._validate_rss_feeds,
+            bg=Theme.BG_PRIMARY, fg=Theme.TEXT_PRIMARY,
+            hover_bg=Theme.BG_TERTIARY,
+            tooltip="Validate the feeds JSON and test connectivity",
+        ).pack(side="left")
+
+    def _validate_rss_feeds(self):
+        """Validate RSS feeds configuration."""
+        feeds_json = self.rss_feeds_text.get("1.0", tk.END).strip()
+        try:
+            feeds = json.loads(feeds_json)
+            if not isinstance(feeds, list):
+                raise ValueError("Feeds must be a JSON array")
+
+            self._log(f"Parsed {len(feeds)} feed(s)", "INFO")
+
+            # Test first feed if available
+            if feeds and 'url' in feeds[0]:
+                self._log(f"Testing feed: {feeds[0].get('name', feeds[0]['url'])}", "INFO")
+
+                def test():
+                    success, msg = test_rss_feed(feeds[0]['url'])
+                    self.root.after(0, lambda: self._on_rss_test_result(success, msg))
+
+                threading.Thread(target=test, daemon=True).start()
+            else:
+                self.toast.show(f"Valid JSON with {len(feeds)} feed(s)", "success")
+
+        except json.JSONDecodeError as e:
+            self._log(f"Invalid JSON: {e}", "ERROR")
+            self.toast.show(f"Invalid JSON: {e}", "error")
+        except ValueError as e:
+            self._log(str(e), "ERROR")
+            self.toast.show(str(e), "error")
+
+    def _on_rss_test_result(self, success: bool, message: str):
+        """Handle RSS feed test result."""
+        if success:
+            self._log(message, "SUCCESS")
+            self.toast.show(message, "success")
+        else:
+            self._log(f"RSS test failed: {message}", "ERROR")
+            self.toast.show(f"Feed test failed: {message}", "error")
+
+    def _create_webmon_page(self):
+        """Create web page monitoring configuration page."""
+        page = self._create_scrollable_page("webmon")
+
+        # Enable toggle
+        toggle_frame = tk.Frame(
+            page, bg=Theme.BG_PRIMARY,
+            highlightbackground=Theme.CARD_BORDER, highlightthickness=1,
+        )
+        toggle_frame.pack(fill="x", pady=(0, 24))
+        ToggleSwitch(toggle_frame, "Enable Web Page Monitoring", self.webmon_var).pack(fill="x")
+
+        # Library status
+        if not BS4_AVAILABLE:
+            warning_frame = tk.Frame(page, bg=Theme.WARNING_LIGHT)
+            warning_frame.pack(fill="x", pady=(0, 24))
+            tk.Label(
+                warning_frame, text="beautifulsoup4 not installed. CSS selectors won't work. Run: pip install beautifulsoup4",
+                bg=Theme.WARNING_LIGHT, fg=Theme.TEXT_PRIMARY, font=(Theme.FONT, 9),
+                padx=16, pady=12,
+            ).pack(fill="x")
+
+        # Settings
+        section1 = FormSection(page, "Web Monitor Settings", "Configure page change detection")
+        section1.pack(fill="x", pady=(0, 24))
+
+        self.webmon_interval = FormRow(
+            section1.content, "Check Interval", "Seconds between checks (default: 300)",
+            tooltip="How often to check pages for changes",
+        )
+        self.webmon_interval.pack(fill="x")
+        self.webmon_interval.set(self.config.get('WebMonitor', 'check_interval', fallback='300'))
+
+        # Pages list
+        section2 = FormSection(page, "Monitored Pages", "Add pages to monitor (JSON format)")
+        section2.pack(fill="x", pady=(0, 24))
+
+        pages_frame = tk.Frame(section2.content, bg=Theme.BG_PRIMARY)
+        pages_frame.pack(fill="x", padx=16, pady=12)
+
+        tk.Label(
+            pages_frame,
+            text='Enter pages as JSON array. Example:\n[{"name": "Product Page", "url": "https://example.com/product", "selector": ".price"}]',
+            bg=Theme.BG_PRIMARY, fg=Theme.TEXT_MUTED, font=(Theme.FONT, 9),
+            justify="left", anchor="w",
+        ).pack(fill="x", pady=(0, 8))
+
+        self.webmon_pages_text = scrolledtext.ScrolledText(
+            pages_frame, height=6, font=(Theme.FONT_MONO, 9),
+            bg=Theme.BG_INPUT, fg=Theme.TEXT_PRIMARY,
+            insertbackground=Theme.PRIMARY, wrap="word",
+        )
+        self.webmon_pages_text.pack(fill="x")
+        self.webmon_pages_text.insert("1.0", self.config.get('WebMonitor', 'pages', fallback='[]'))
+
+        # Validate button
+        btn_frame = tk.Frame(page, bg=Theme.BG_SECONDARY)
+        btn_frame.pack(fill="x", pady=(0, 24))
+
+        ModernButton(
+            btn_frame, text="Validate Pages",
+            command=self._validate_webmon_pages,
+            bg=Theme.BG_PRIMARY, fg=Theme.TEXT_PRIMARY,
+            hover_bg=Theme.BG_TERTIARY,
+            tooltip="Validate the pages JSON configuration",
+        ).pack(side="left")
+
+    def _validate_webmon_pages(self):
+        """Validate web monitor pages configuration."""
+        pages_json = self.webmon_pages_text.get("1.0", tk.END).strip()
+        try:
+            pages = json.loads(pages_json)
+            if not isinstance(pages, list):
+                raise ValueError("Pages must be a JSON array")
+
+            self._log(f"Parsed {len(pages)} page(s)", "INFO")
+            self.toast.show(f"Valid JSON with {len(pages)} page(s)", "success")
+
+        except json.JSONDecodeError as e:
+            self._log(f"Invalid JSON: {e}", "ERROR")
+            self.toast.show(f"Invalid JSON: {e}", "error")
+        except ValueError as e:
+            self._log(str(e), "ERROR")
+            self.toast.show(str(e), "error")
+
+    def _create_httpmon_page(self):
+        """Create HTTP endpoint monitoring configuration page."""
+        page = self._create_scrollable_page("httpmon")
+
+        # Enable toggle
+        toggle_frame = tk.Frame(
+            page, bg=Theme.BG_PRIMARY,
+            highlightbackground=Theme.CARD_BORDER, highlightthickness=1,
+        )
+        toggle_frame.pack(fill="x", pady=(0, 24))
+        ToggleSwitch(toggle_frame, "Enable HTTP Endpoint Monitoring", self.httpmon_var).pack(fill="x")
+
+        # Settings
+        section1 = FormSection(page, "HTTP Monitor Settings", "Configure endpoint monitoring")
+        section1.pack(fill="x", pady=(0, 24))
+
+        self.httpmon_interval = FormRow(
+            section1.content, "Check Interval", "Seconds between checks (default: 60)",
+            tooltip="How often to check endpoints",
+        )
+        self.httpmon_interval.pack(fill="x")
+        self.httpmon_interval.set(self.config.get('HttpMonitor', 'check_interval', fallback='60'))
+
+        # Endpoints list
+        section2 = FormSection(page, "Monitored Endpoints", "Add endpoints to monitor (JSON format)")
+        section2.pack(fill="x", pady=(0, 24))
+
+        endpoints_frame = tk.Frame(section2.content, bg=Theme.BG_PRIMARY)
+        endpoints_frame.pack(fill="x", padx=16, pady=12)
+
+        tk.Label(
+            endpoints_frame,
+            text='Enter endpoints as JSON array. Example:\n[{"name": "API Health", "url": "https://api.example.com/health", "expected_status": 200}]',
+            bg=Theme.BG_PRIMARY, fg=Theme.TEXT_MUTED, font=(Theme.FONT, 9),
+            justify="left", anchor="w",
+        ).pack(fill="x", pady=(0, 8))
+
+        self.httpmon_endpoints_text = scrolledtext.ScrolledText(
+            endpoints_frame, height=6, font=(Theme.FONT_MONO, 9),
+            bg=Theme.BG_INPUT, fg=Theme.TEXT_PRIMARY,
+            insertbackground=Theme.PRIMARY, wrap="word",
+        )
+        self.httpmon_endpoints_text.pack(fill="x")
+        self.httpmon_endpoints_text.insert("1.0", self.config.get('HttpMonitor', 'endpoints', fallback='[]'))
+
+        # Validate button
+        btn_frame = tk.Frame(page, bg=Theme.BG_SECONDARY)
+        btn_frame.pack(fill="x", pady=(0, 24))
+
+        ModernButton(
+            btn_frame, text="Validate & Test",
+            command=self._validate_httpmon_endpoints,
+            bg=Theme.BG_PRIMARY, fg=Theme.TEXT_PRIMARY,
+            hover_bg=Theme.BG_TERTIARY,
+            tooltip="Validate the endpoints JSON and test first endpoint",
+        ).pack(side="left")
+
+    def _validate_httpmon_endpoints(self):
+        """Validate HTTP endpoints configuration."""
+        endpoints_json = self.httpmon_endpoints_text.get("1.0", tk.END).strip()
+        try:
+            endpoints = json.loads(endpoints_json)
+            if not isinstance(endpoints, list):
+                raise ValueError("Endpoints must be a JSON array")
+
+            self._log(f"Parsed {len(endpoints)} endpoint(s)", "INFO")
+
+            # Test first endpoint if available
+            if endpoints and 'url' in endpoints[0]:
+                ep = endpoints[0]
+                self._log(f"Testing endpoint: {ep.get('name', ep['url'])}", "INFO")
+
+                def test():
+                    success, msg = test_http_endpoint(
+                        ep['url'],
+                        ep.get('method', 'GET'),
+                        ep.get('expected_status', 200)
+                    )
+                    self.root.after(0, lambda: self._on_httpmon_test_result(success, msg))
+
+                threading.Thread(target=test, daemon=True).start()
+            else:
+                self.toast.show(f"Valid JSON with {len(endpoints)} endpoint(s)", "success")
+
+        except json.JSONDecodeError as e:
+            self._log(f"Invalid JSON: {e}", "ERROR")
+            self.toast.show(f"Invalid JSON: {e}", "error")
+        except ValueError as e:
+            self._log(str(e), "ERROR")
+            self.toast.show(str(e), "error")
+
+    def _on_httpmon_test_result(self, success: bool, message: str):
+        """Handle HTTP endpoint test result."""
+        if success:
+            self._log(message, "SUCCESS")
+            self.toast.show(message, "success")
+        else:
+            self._log(f"HTTP test failed: {message}", "ERROR")
+            self.toast.show(f"Endpoint test failed: {message}", "error")
+
     def _create_logs_page(self):
         page = tk.Frame(self.content, bg=Theme.BG_SECONDARY)
         self.pages["logs"] = page
@@ -1806,6 +2307,41 @@ class EmailMonitorApp:
 
         self.config['CustomWebhook']['webhook_url'] = self.webhook_url.get()
 
+        # SMTP settings
+        if 'SMTP' not in self.config:
+            self.config['SMTP'] = {}
+        self.config['SMTP']['enabled'] = str(self.smtp_var.get())
+        self.config['SMTP']['smtp_server'] = self.smtp_server.get()
+        self.config['SMTP']['smtp_port'] = self.smtp_port.get()
+        self.config['SMTP']['use_tls'] = str(self.smtp_tls_var.get())
+        self.config['SMTP']['username'] = self.smtp_username.get()
+        self.config['SMTP']['password'] = self.smtp_password.get()
+        self.config['SMTP']['from_address'] = self.smtp_from.get()
+        self.config['SMTP']['to_addresses'] = self.smtp_to.get()
+        self.config['SMTP']['subject_prefix'] = self.smtp_prefix.get()
+
+        # RSS settings
+        if 'RSS' not in self.config:
+            self.config['RSS'] = {}
+        self.config['RSS']['enabled'] = str(self.rss_var.get())
+        self.config['RSS']['check_interval'] = self.rss_interval.get()
+        self.config['RSS']['max_age_hours'] = self.rss_max_age.get()
+        self.config['RSS']['feeds'] = self.rss_feeds_text.get("1.0", tk.END).strip()
+
+        # Web monitor settings
+        if 'WebMonitor' not in self.config:
+            self.config['WebMonitor'] = {}
+        self.config['WebMonitor']['enabled'] = str(self.webmon_var.get())
+        self.config['WebMonitor']['check_interval'] = self.webmon_interval.get()
+        self.config['WebMonitor']['pages'] = self.webmon_pages_text.get("1.0", tk.END).strip()
+
+        # HTTP monitor settings
+        if 'HttpMonitor' not in self.config:
+            self.config['HttpMonitor'] = {}
+        self.config['HttpMonitor']['enabled'] = str(self.httpmon_var.get())
+        self.config['HttpMonitor']['check_interval'] = self.httpmon_interval.get()
+        self.config['HttpMonitor']['endpoints'] = self.httpmon_endpoints_text.get("1.0", tk.END).strip()
+
     def _save_settings(self):
         try:
             self._update_config()
@@ -1883,6 +2419,12 @@ class EmailMonitorApp:
 
     def _monitor_loop(self):
         dispatcher = NotificationDispatcher(self.config)
+        monitor_state = MonitorState()
+
+        # Load monitoring source configs
+        rss_config = RssFeedConfig.from_config(self.config)
+        web_config = WebMonitorConfig.from_config(self.config)
+        http_config = HttpEndpointConfig.from_config(self.config)
 
         while not self.stop_event.is_set():
             imap = None
@@ -1891,10 +2433,13 @@ class EmailMonitorApp:
                 filters = [f.strip().lower() for f in self.config.get('Email', 'filter_emails', fallback='').split(',') if f.strip()]
 
                 self.root.after(0, lambda: self._update_status_bar(
-                    "Checking for new emails...",
+                    "Checking sources...",
                     datetime.now().strftime('%H:%M:%S'),
                 ))
 
+                # =====================================================
+                # Check Email (IMAP)
+                # =====================================================
                 imap = connect_to_imap(
                     self.config.get('Email', 'imap_server'),
                     int(self.config.get('Email', 'imap_port', fallback='993')),
@@ -1902,49 +2447,113 @@ class EmailMonitorApp:
                     self.config.get('Email', 'password')
                 )
 
-                if not imap:
-                    self._log(f"Connection failed. Retry in {interval}s", "WARNING")
-                    self.root.after(0, lambda: self._update_status_bar("Connection failed, retrying..."))
-                    self.stop_event.wait(interval)
-                    continue
+                if imap:
+                    emails = fetch_unread_emails(imap)
+                    if emails:
+                        self._log(f"Found {len(emails)} unread email(s)", "INFO")
 
-                emails = fetch_unread_emails(imap)
-                self._log(f"Found {len(emails)} unread email(s)", "INFO")
-                self.root.after(0, lambda n=len(emails): self._update_status_bar(
-                    f"Monitoring active - {n} unread",
+                    for email_id, msg in emails:
+                        if self.stop_event.is_set():
+                            break
+
+                        sender = get_sender_email(msg)
+                        if filters and not check_email_filter(sender, filters):
+                            continue
+
+                        subject = decode_email_subject(msg)
+                        body = extract_email_body(msg)
+
+                        self._log(f"Processing email: {subject[:40]}...", "INFO")
+
+                        notification = EmailNotification(
+                            email_id=email_id,
+                            sender=sender,
+                            subject=subject,
+                            body=body
+                        )
+
+                        results = dispatcher.dispatch(
+                            notification,
+                            callback=lambda r: self._log(
+                                f"{r.service}: {r.message}",
+                                "SUCCESS" if r.success else "ERROR"
+                            )
+                        )
+
+                        if any(r.success for r in results):
+                            mark_as_read(imap, email_id)
+                else:
+                    self._log("Email connection failed", "WARNING")
+
+                # =====================================================
+                # Check RSS Feeds
+                # =====================================================
+                if rss_config.enabled:
+                    rss_events = check_rss_feeds(rss_config, monitor_state)
+                    for event in rss_events:
+                        if self.stop_event.is_set():
+                            break
+                        self._log(f"RSS: {event.title[:50]}...", "INFO")
+                        notification = event.to_email_notification()
+                        dispatcher.dispatch(
+                            notification,
+                            callback=lambda r: self._log(
+                                f"{r.service}: {r.message}",
+                                "SUCCESS" if r.success else "ERROR"
+                            )
+                        )
+
+                # =====================================================
+                # Check Web Pages
+                # =====================================================
+                if web_config.enabled:
+                    web_events = check_web_pages(web_config, monitor_state)
+                    for event in web_events:
+                        if self.stop_event.is_set():
+                            break
+                        self._log(f"Web: {event.title}", "INFO")
+                        notification = event.to_email_notification()
+                        dispatcher.dispatch(
+                            notification,
+                            callback=lambda r: self._log(
+                                f"{r.service}: {r.message}",
+                                "SUCCESS" if r.success else "ERROR"
+                            )
+                        )
+
+                # =====================================================
+                # Check HTTP Endpoints
+                # =====================================================
+                if http_config.enabled:
+                    http_events = check_http_endpoints(http_config, monitor_state)
+                    for event in http_events:
+                        if self.stop_event.is_set():
+                            break
+                        level = "ERROR" if event.severity == "error" else "INFO"
+                        self._log(f"HTTP: {event.title}", level)
+                        notification = event.to_email_notification()
+                        dispatcher.dispatch(
+                            notification,
+                            callback=lambda r: self._log(
+                                f"{r.service}: {r.message}",
+                                "SUCCESS" if r.success else "ERROR"
+                            )
+                        )
+
+                # Save state
+                monitor_state.save()
+
+                # Update status
+                sources_active = sum([
+                    1 if imap else 0,
+                    1 if rss_config.enabled else 0,
+                    1 if web_config.enabled else 0,
+                    1 if http_config.enabled else 0,
+                ])
+                self.root.after(0, lambda n=sources_active: self._update_status_bar(
+                    f"Monitoring {n} source(s)",
                     f"Last check: {datetime.now().strftime('%H:%M:%S')}",
                 ))
-
-                for email_id, msg in emails:
-                    if self.stop_event.is_set():
-                        break
-
-                    sender = get_sender_email(msg)
-                    if filters and not check_email_filter(sender, filters):
-                        continue
-
-                    subject = decode_email_subject(msg)
-                    body = extract_email_body(msg)
-
-                    self._log(f"Processing: {subject[:40]}...", "INFO")
-
-                    notification = EmailNotification(
-                        email_id=email_id,
-                        sender=sender,
-                        subject=subject,
-                        body=body
-                    )
-
-                    results = dispatcher.dispatch(
-                        notification,
-                        callback=lambda r: self._log(
-                            f"{r.service}: {r.message}",
-                            "SUCCESS" if r.success else "ERROR"
-                        )
-                    )
-
-                    if any(r.success for r in results):
-                        mark_as_read(imap, email_id)
 
             except Exception as e:
                 self._log(f"Error: {e}", "ERROR")

@@ -14,18 +14,24 @@ Version: 1.0.0
 from __future__ import annotations
 
 import configparser
+import hashlib
 import imaplib
+import json
 import logging
 import os
 import re
+import smtplib
+import ssl
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.header import decode_header
 from email.message import Message
-from email.utils import parseaddr
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import parseaddr, formataddr
 from html import escape as html_escape
-from typing import Any, Callable, List, Optional, Tuple, Dict
+from typing import Any, Callable, List, Optional, Tuple, Dict, Set
 from urllib.parse import urlparse
 
 import requests
@@ -49,6 +55,20 @@ except ImportError:
     SlackWebClient = None
     SlackApiError = Exception
 
+try:
+    import feedparser
+    FEEDPARSER_AVAILABLE = True
+except ImportError:
+    FEEDPARSER_AVAILABLE = False
+    feedparser = None
+
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
+    BeautifulSoup = None
+
 # Version information
 __version__ = "1.0.0"
 __author__ = "Seth Morrow"
@@ -56,6 +76,7 @@ __author__ = "Seth Morrow"
 # Constants
 CONFIG_FILE_PATH = 'config.ini'
 LOG_FILE_PATH = 'email_monitor.log'
+STATE_FILE_PATH = 'e2nb_state.json'
 DEFAULT_CHECK_INTERVAL = 60
 DEFAULT_MAX_SMS_LENGTH = 1600
 DEFAULT_IMAP_PORT = 993
@@ -63,6 +84,9 @@ MAX_EMAILS_PER_CHECK = 5
 DEFAULT_TIMEOUT = 30
 MAX_RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_FACTOR = 0.5
+DEFAULT_RSS_MAX_AGE_HOURS = 24
+DEFAULT_RSS_MAX_ITEMS = 10
+DEFAULT_WEB_CHECK_INTERVAL = 300
 
 # Logger setup
 logger = logging.getLogger(__name__)
@@ -225,6 +249,176 @@ class WebhookConfig:
         return cls(
             enabled=section.getboolean('enabled', fallback=False),
             webhook_url=section.get('webhook_url', '')
+        )
+
+
+@dataclass
+class SmtpConfig:
+    """SMTP email notification configuration."""
+    enabled: bool = False
+    smtp_server: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    use_tls: bool = True
+    username: str = ""
+    password: str = ""
+    from_address: str = ""
+    to_addresses: List[str] = field(default_factory=list)
+    subject_prefix: str = "[E2NB]"
+
+    @classmethod
+    def from_config(cls, config: configparser.ConfigParser) -> 'SmtpConfig':
+        """Create SmtpConfig from ConfigParser."""
+        if 'SMTP' not in config:
+            return cls()
+        section = config['SMTP']
+        to_str = section.get('to_addresses', '')
+        to_addresses = [addr.strip() for addr in to_str.split(',') if addr.strip()]
+        return cls(
+            enabled=section.getboolean('enabled', fallback=False),
+            smtp_server=section.get('smtp_server', 'smtp.gmail.com'),
+            smtp_port=int(section.get('smtp_port', '587')),
+            use_tls=section.getboolean('use_tls', fallback=True),
+            username=section.get('username', ''),
+            password=section.get('password', ''),
+            from_address=section.get('from_address', ''),
+            to_addresses=to_addresses,
+            subject_prefix=section.get('subject_prefix', '[E2NB]')
+        )
+
+
+# =============================================================================
+# Monitoring Source Configurations
+# =============================================================================
+
+@dataclass
+class RssFeedConfig:
+    """RSS/Atom feed monitoring configuration."""
+    enabled: bool = False
+    feeds: List[Dict[str, Any]] = field(default_factory=list)
+    check_interval: int = 300  # 5 minutes default
+    max_age_hours: int = DEFAULT_RSS_MAX_AGE_HOURS
+    max_items_per_check: int = DEFAULT_RSS_MAX_ITEMS
+
+    @classmethod
+    def from_config(cls, config: configparser.ConfigParser) -> 'RssFeedConfig':
+        """Create RssFeedConfig from ConfigParser."""
+        if 'RSS' not in config:
+            return cls()
+        section = config['RSS']
+
+        # Parse feeds from JSON string
+        feeds_str = section.get('feeds', '[]')
+        try:
+            feeds = json.loads(feeds_str)
+        except json.JSONDecodeError:
+            feeds = []
+
+        return cls(
+            enabled=section.getboolean('enabled', fallback=False),
+            feeds=feeds,
+            check_interval=int(section.get('check_interval', '300')),
+            max_age_hours=int(section.get('max_age_hours', str(DEFAULT_RSS_MAX_AGE_HOURS))),
+            max_items_per_check=int(section.get('max_items_per_check', str(DEFAULT_RSS_MAX_ITEMS)))
+        )
+
+
+@dataclass
+class WebMonitorConfig:
+    """Web page change detection configuration."""
+    enabled: bool = False
+    pages: List[Dict[str, Any]] = field(default_factory=list)
+    check_interval: int = DEFAULT_WEB_CHECK_INTERVAL
+
+    @classmethod
+    def from_config(cls, config: configparser.ConfigParser) -> 'WebMonitorConfig':
+        """Create WebMonitorConfig from ConfigParser."""
+        if 'WebMonitor' not in config:
+            return cls()
+        section = config['WebMonitor']
+
+        # Parse pages from JSON string
+        pages_str = section.get('pages', '[]')
+        try:
+            pages = json.loads(pages_str)
+        except json.JSONDecodeError:
+            pages = []
+
+        return cls(
+            enabled=section.getboolean('enabled', fallback=False),
+            pages=pages,
+            check_interval=int(section.get('check_interval', str(DEFAULT_WEB_CHECK_INTERVAL)))
+        )
+
+
+@dataclass
+class HttpEndpointConfig:
+    """HTTP endpoint monitoring configuration."""
+    enabled: bool = False
+    endpoints: List[Dict[str, Any]] = field(default_factory=list)
+    check_interval: int = 60
+
+    @classmethod
+    def from_config(cls, config: configparser.ConfigParser) -> 'HttpEndpointConfig':
+        """Create HttpEndpointConfig from ConfigParser."""
+        if 'HttpMonitor' not in config:
+            return cls()
+        section = config['HttpMonitor']
+
+        # Parse endpoints from JSON string
+        endpoints_str = section.get('endpoints', '[]')
+        try:
+            endpoints = json.loads(endpoints_str)
+        except json.JSONDecodeError:
+            endpoints = []
+
+        return cls(
+            enabled=section.getboolean('enabled', fallback=False),
+            endpoints=endpoints,
+            check_interval=int(section.get('check_interval', '60'))
+        )
+
+
+# =============================================================================
+# Generic Monitor Event
+# =============================================================================
+
+@dataclass
+class MonitorEvent:
+    """
+    Generic event from any monitoring source.
+
+    This unified event class allows all monitoring sources (email, RSS, web, HTTP)
+    to produce events that can be dispatched through the same notification channels.
+    """
+    source_type: str  # 'email', 'rss', 'web', 'http'
+    source_name: str  # User-defined name or identifier
+    title: str  # Event title/subject
+    body: str  # Event details/content
+    timestamp: datetime = field(default_factory=datetime.now)
+    severity: str = "info"  # 'info', 'warning', 'error', 'critical'
+    url: Optional[str] = None  # Optional link to source
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def notification_message(self) -> str:
+        """Get combined title and body for notification."""
+        return f"[{self.source_type.upper()}] {self.title}: {self.body}"
+
+    def truncate_for_sms(self, max_length: int) -> str:
+        """Get truncated message for SMS."""
+        msg = self.notification_message
+        if len(msg) > max_length:
+            return msg[:max_length - 3] + "..."
+        return msg
+
+    def to_email_notification(self) -> 'EmailNotification':
+        """Convert to EmailNotification for backward compatibility."""
+        return EmailNotification(
+            email_id=self.metadata.get('id', b'0'),
+            sender=self.source_name,
+            subject=f"[{self.source_type.upper()}] {self.title}",
+            body=self.body,
+            timestamp=self.timestamp
         )
 
 
@@ -506,6 +700,39 @@ def create_default_config(config_file: str = CONFIG_FILE_PATH) -> None:
     config['CustomWebhook'] = {
         'enabled': 'False',
         'webhook_url': ''
+    }
+
+    config['SMTP'] = {
+        'enabled': 'False',
+        'smtp_server': 'smtp.gmail.com',
+        'smtp_port': '587',
+        'use_tls': 'True',
+        'username': '',
+        'password': '',
+        'from_address': '',
+        'to_addresses': '',
+        'subject_prefix': '[E2NB]'
+    }
+
+    # Monitoring Sources
+    config['RSS'] = {
+        'enabled': 'False',
+        'feeds': '[]',
+        'check_interval': '300',
+        'max_age_hours': str(DEFAULT_RSS_MAX_AGE_HOURS),
+        'max_items_per_check': str(DEFAULT_RSS_MAX_ITEMS)
+    }
+
+    config['WebMonitor'] = {
+        'enabled': 'False',
+        'pages': '[]',
+        'check_interval': str(DEFAULT_WEB_CHECK_INTERVAL)
+    }
+
+    config['HttpMonitor'] = {
+        'enabled': 'False',
+        'endpoints': '[]',
+        'check_interval': '60'
     }
 
     with open(config_file, 'w') as file:
@@ -1080,6 +1307,133 @@ def send_custom_webhook(
         return NotificationResult(False, "Webhook", str(e))
 
 
+def send_email_notification(
+    smtp_server: str,
+    smtp_port: int,
+    username: str,
+    password: str,
+    from_address: str,
+    to_address: str,
+    subject: str,
+    body: str,
+    sender_email: str,
+    use_tls: bool = True,
+    subject_prefix: str = "[E2NB]"
+) -> NotificationResult:
+    """
+    Send an email notification via SMTP.
+
+    Args:
+        smtp_server: SMTP server hostname.
+        smtp_port: SMTP server port.
+        username: SMTP authentication username.
+        password: SMTP authentication password.
+        from_address: Sender email address.
+        to_address: Recipient email address.
+        subject: Original email subject.
+        body: Original email body.
+        sender_email: Original sender's email address.
+        use_tls: Whether to use TLS encryption.
+        subject_prefix: Prefix to add to subject line.
+
+    Returns:
+        NotificationResult with success status.
+    """
+    if not validate_email(to_address):
+        return NotificationResult(False, "Email", f"Invalid recipient address: {to_address}")
+
+    if not validate_email(from_address):
+        return NotificationResult(False, "Email", f"Invalid sender address: {from_address}")
+
+    try:
+        # Create message
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = f"{subject_prefix} {subject}"
+        msg['From'] = formataddr(("E2NB Notification", from_address))
+        msg['To'] = to_address
+
+        # Plain text version
+        text_body = f"""E2NB Email Notification
+{'=' * 40}
+
+From: {sender_email}
+Subject: {subject}
+
+{'=' * 40}
+{body}
+{'=' * 40}
+
+This notification was sent by E2NB - Email to Notification Blaster.
+"""
+
+        # HTML version
+        html_body = f"""<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #333; }}
+        .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+        .header {{ background: #3b82f6; color: white; padding: 20px; border-radius: 8px 8px 0 0; }}
+        .header h1 {{ margin: 0; font-size: 18px; }}
+        .content {{ background: #f8fafc; padding: 20px; border: 1px solid #e2e8f0; }}
+        .meta {{ background: #fff; padding: 12px; border-radius: 4px; margin-bottom: 16px; border-left: 4px solid #3b82f6; }}
+        .meta strong {{ color: #1e40af; }}
+        .body {{ background: #fff; padding: 16px; border-radius: 4px; white-space: pre-wrap; font-family: monospace; font-size: 13px; }}
+        .footer {{ background: #f1f5f9; padding: 12px; text-align: center; font-size: 12px; color: #64748b; border-radius: 0 0 8px 8px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>E2NB Email Notification</h1>
+        </div>
+        <div class="content">
+            <div class="meta">
+                <strong>From:</strong> {html_escape(sender_email)}<br>
+                <strong>Subject:</strong> {html_escape(subject)}
+            </div>
+            <div class="body">{html_escape(body)}</div>
+        </div>
+        <div class="footer">
+            Sent by E2NB - Email to Notification Blaster
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+        msg.attach(MIMEText(text_body, 'plain'))
+        msg.attach(MIMEText(html_body, 'html'))
+
+        # Connect and send
+        if use_tls and smtp_port == 465:
+            # SSL connection (port 465)
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(smtp_server, smtp_port, context=context, timeout=DEFAULT_TIMEOUT) as server:
+                server.login(username, password)
+                server.sendmail(from_address, to_address, msg.as_string())
+        else:
+            # STARTTLS connection (port 587) or no TLS
+            with smtplib.SMTP(smtp_server, smtp_port, timeout=DEFAULT_TIMEOUT) as server:
+                if use_tls:
+                    context = ssl.create_default_context()
+                    server.starttls(context=context)
+                server.login(username, password)
+                server.sendmail(from_address, to_address, msg.as_string())
+
+        logger.info(f"Sent email notification to {to_address}")
+        return NotificationResult(True, "Email", f"Sent to {to_address}")
+    except smtplib.SMTPAuthenticationError as e:
+        logger.error(f"SMTP authentication failed: {e}")
+        return NotificationResult(False, "Email", "Authentication failed")
+    except smtplib.SMTPException as e:
+        logger.error(f"SMTP error sending to {to_address}: {e}")
+        return NotificationResult(False, "Email", str(e))
+    except Exception as e:
+        logger.error(f"Failed to send email notification to {to_address}: {e}")
+        return NotificationResult(False, "Email", str(e))
+
+
 # =============================================================================
 # Email Processing
 # =============================================================================
@@ -1118,6 +1472,7 @@ class NotificationDispatcher:
         self.telegram = TelegramConfig.from_config(config)
         self.discord = DiscordConfig.from_config(config)
         self.webhook = WebhookConfig.from_config(config)
+        self.smtp = SmtpConfig.from_config(config)
         self.http_session = create_http_session()
 
     def has_any_enabled(self) -> bool:
@@ -1129,7 +1484,8 @@ class NotificationDispatcher:
             self.slack.enabled,
             self.telegram.enabled,
             self.discord.enabled,
-            self.webhook.enabled
+            self.webhook.enabled,
+            self.smtp.enabled
         ])
 
     def dispatch(
@@ -1246,6 +1602,26 @@ class NotificationDispatcher:
             if callback:
                 callback(result)
 
+        # SMTP Email
+        if self.smtp.enabled:
+            for to_address in self.smtp.to_addresses:
+                result = send_email_notification(
+                    self.smtp.smtp_server,
+                    self.smtp.smtp_port,
+                    self.smtp.username,
+                    self.smtp.password,
+                    self.smtp.from_address,
+                    to_address,
+                    notification.subject,
+                    notification.body,
+                    notification.sender,
+                    self.smtp.use_tls,
+                    self.smtp.subject_prefix
+                )
+                results.append(result)
+                if callback:
+                    callback(result)
+
         return results
 
 
@@ -1272,3 +1648,658 @@ def test_imap_connection(config: EmailConfig) -> Tuple[bool, str]:
         return False, "Connection failed - check credentials"
     except Exception as e:
         return False, str(e)
+
+
+def test_smtp_connection(config: SmtpConfig) -> Tuple[bool, str]:
+    """
+    Test SMTP connection with provided configuration.
+
+    Args:
+        config: SMTP configuration to test.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    try:
+        if config.use_tls and config.smtp_port == 465:
+            # SSL connection (port 465)
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(config.smtp_server, config.smtp_port, context=context, timeout=DEFAULT_TIMEOUT) as server:
+                server.login(config.username, config.password)
+                return True, f"Successfully connected to {config.smtp_server}:{config.smtp_port} (SSL)"
+        else:
+            # STARTTLS connection (port 587) or no TLS
+            with smtplib.SMTP(config.smtp_server, config.smtp_port, timeout=DEFAULT_TIMEOUT) as server:
+                server.ehlo()
+                if config.use_tls:
+                    context = ssl.create_default_context()
+                    server.starttls(context=context)
+                    server.ehlo()
+                server.login(config.username, config.password)
+                tls_status = "TLS" if config.use_tls else "no TLS"
+                return True, f"Successfully connected to {config.smtp_server}:{config.smtp_port} ({tls_status})"
+    except smtplib.SMTPAuthenticationError:
+        return False, "Authentication failed - check username and password"
+    except smtplib.SMTPConnectError:
+        return False, f"Could not connect to {config.smtp_server}:{config.smtp_port}"
+    except TimeoutError:
+        return False, f"Connection to {config.smtp_server}:{config.smtp_port} timed out"
+    except Exception as e:
+        return False, str(e)
+
+
+# =============================================================================
+# State Management for Monitoring Sources
+# =============================================================================
+
+class MonitorState:
+    """
+    Manages persistent state for monitoring sources.
+
+    Tracks which items have been seen to avoid duplicate notifications.
+    State is persisted to a JSON file.
+    """
+
+    def __init__(self, state_file: str = STATE_FILE_PATH):
+        self.state_file = state_file
+        self._state: Dict[str, Any] = {
+            'seen_rss_items': {},  # feed_url -> set of item IDs
+            'web_page_hashes': {},  # page_url -> content hash
+            'http_endpoint_status': {},  # endpoint_url -> last status
+            'last_updated': None
+        }
+        self._load()
+
+    def _load(self):
+        """Load state from file."""
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, 'r') as f:
+                    loaded = json.load(f)
+                    # Convert lists back to sets for seen_rss_items
+                    if 'seen_rss_items' in loaded:
+                        loaded['seen_rss_items'] = {
+                            k: set(v) for k, v in loaded['seen_rss_items'].items()
+                        }
+                    self._state.update(loaded)
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning(f"Could not load state file: {e}")
+
+    def save(self):
+        """Save state to file."""
+        try:
+            # Convert sets to lists for JSON serialization
+            state_to_save = self._state.copy()
+            if 'seen_rss_items' in state_to_save:
+                state_to_save['seen_rss_items'] = {
+                    k: list(v) for k, v in state_to_save['seen_rss_items'].items()
+                }
+            state_to_save['last_updated'] = datetime.now().isoformat()
+
+            with open(self.state_file, 'w') as f:
+                json.dump(state_to_save, f, indent=2)
+        except IOError as e:
+            logger.error(f"Could not save state file: {e}")
+
+    def is_rss_item_seen(self, feed_url: str, item_id: str) -> bool:
+        """Check if an RSS item has been seen before."""
+        seen = self._state.get('seen_rss_items', {}).get(feed_url, set())
+        return item_id in seen
+
+    def mark_rss_item_seen(self, feed_url: str, item_id: str):
+        """Mark an RSS item as seen."""
+        if feed_url not in self._state['seen_rss_items']:
+            self._state['seen_rss_items'][feed_url] = set()
+        self._state['seen_rss_items'][feed_url].add(item_id)
+
+    def get_web_page_hash(self, url: str) -> Optional[str]:
+        """Get stored hash for a web page."""
+        return self._state.get('web_page_hashes', {}).get(url)
+
+    def set_web_page_hash(self, url: str, content_hash: str):
+        """Store hash for a web page."""
+        if 'web_page_hashes' not in self._state:
+            self._state['web_page_hashes'] = {}
+        self._state['web_page_hashes'][url] = content_hash
+
+    def get_http_status(self, url: str) -> Optional[Dict[str, Any]]:
+        """Get last known status for an HTTP endpoint."""
+        return self._state.get('http_endpoint_status', {}).get(url)
+
+    def set_http_status(self, url: str, status: Dict[str, Any]):
+        """Store status for an HTTP endpoint."""
+        if 'http_endpoint_status' not in self._state:
+            self._state['http_endpoint_status'] = {}
+        self._state['http_endpoint_status'][url] = status
+
+    def cleanup_old_rss_items(self, feed_url: str, max_items: int = 1000):
+        """Limit stored RSS items to prevent unbounded growth."""
+        if feed_url in self._state.get('seen_rss_items', {}):
+            items = self._state['seen_rss_items'][feed_url]
+            if len(items) > max_items:
+                # Convert to list, keep recent items, convert back to set
+                items_list = list(items)
+                self._state['seen_rss_items'][feed_url] = set(items_list[-max_items:])
+
+
+# =============================================================================
+# RSS Feed Monitoring
+# =============================================================================
+
+def fetch_rss_feed(
+    feed_url: str,
+    session: Optional[requests.Session] = None
+) -> Tuple[bool, Optional[Any], str]:
+    """
+    Fetch and parse an RSS/Atom feed.
+
+    Args:
+        feed_url: URL of the RSS/Atom feed.
+        session: Optional requests session.
+
+    Returns:
+        Tuple of (success, parsed_feed, error_message).
+    """
+    if not FEEDPARSER_AVAILABLE:
+        return False, None, "feedparser library not installed"
+
+    if not validate_url(feed_url):
+        return False, None, f"Invalid feed URL: {feed_url}"
+
+    try:
+        http_session = session or create_http_session()
+        response = http_session.get(feed_url, timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
+
+        feed = feedparser.parse(response.content)
+
+        if feed.bozo and not feed.entries:
+            return False, None, f"Feed parsing error: {feed.bozo_exception}"
+
+        return True, feed, ""
+    except requests.RequestException as e:
+        return False, None, f"Failed to fetch feed: {e}"
+    except Exception as e:
+        return False, None, f"Error parsing feed: {e}"
+
+
+def get_rss_item_id(entry: Any) -> str:
+    """
+    Get a unique identifier for an RSS entry.
+
+    Args:
+        entry: Feedparser entry object.
+
+    Returns:
+        Unique identifier string.
+    """
+    # Try various ID fields in order of preference
+    if hasattr(entry, 'id') and entry.id:
+        return entry.id
+    if hasattr(entry, 'link') and entry.link:
+        return entry.link
+    if hasattr(entry, 'title') and entry.title:
+        # Hash of title + published date as fallback
+        pub_date = getattr(entry, 'published', '') or getattr(entry, 'updated', '')
+        return hashlib.md5(f"{entry.title}{pub_date}".encode()).hexdigest()
+    return hashlib.md5(str(entry).encode()).hexdigest()
+
+
+def get_rss_entry_date(entry: Any) -> Optional[datetime]:
+    """
+    Extract publication date from an RSS entry.
+
+    Args:
+        entry: Feedparser entry object.
+
+    Returns:
+        Datetime object or None if not available.
+    """
+    for date_field in ['published_parsed', 'updated_parsed', 'created_parsed']:
+        parsed_date = getattr(entry, date_field, None)
+        if parsed_date:
+            try:
+                return datetime(*parsed_date[:6])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def check_rss_feeds(
+    config: RssFeedConfig,
+    state: MonitorState,
+    session: Optional[requests.Session] = None
+) -> List[MonitorEvent]:
+    """
+    Check RSS feeds for new items.
+
+    Args:
+        config: RSS feed configuration.
+        state: Monitor state for tracking seen items.
+        session: Optional requests session.
+
+    Returns:
+        List of MonitorEvent objects for new items.
+    """
+    if not config.enabled or not config.feeds:
+        return []
+
+    if not FEEDPARSER_AVAILABLE:
+        logger.warning("feedparser not installed, skipping RSS monitoring")
+        return []
+
+    events = []
+    max_age = timedelta(hours=config.max_age_hours)
+    now = datetime.now()
+
+    for feed_config in config.feeds:
+        feed_url = feed_config.get('url', '')
+        feed_name = feed_config.get('name', feed_url)
+        keywords = [k.lower() for k in feed_config.get('keywords', [])]
+
+        if not feed_url:
+            continue
+
+        success, feed, error = fetch_rss_feed(feed_url, session)
+        if not success:
+            logger.warning(f"Failed to fetch RSS feed '{feed_name}': {error}")
+            continue
+
+        items_found = 0
+        for entry in feed.entries:
+            if items_found >= config.max_items_per_check:
+                break
+
+            item_id = get_rss_item_id(entry)
+
+            # Skip if already seen
+            if state.is_rss_item_seen(feed_url, item_id):
+                continue
+
+            # Check age if date available
+            pub_date = get_rss_entry_date(entry)
+            if pub_date and (now - pub_date) > max_age:
+                # Item is too old, but mark as seen to avoid checking again
+                state.mark_rss_item_seen(feed_url, item_id)
+                continue
+
+            # Extract content
+            title = getattr(entry, 'title', 'No Title')
+            summary = getattr(entry, 'summary', '') or getattr(entry, 'description', '')
+            link = getattr(entry, 'link', '')
+
+            # Clean up summary (remove HTML tags if present)
+            if summary and BS4_AVAILABLE:
+                try:
+                    soup = BeautifulSoup(summary, 'html.parser')
+                    summary = soup.get_text(separator=' ', strip=True)
+                except Exception:
+                    pass
+            elif summary:
+                # Basic HTML tag removal
+                summary = re.sub(r'<[^>]+>', '', summary)
+
+            # Truncate summary
+            if len(summary) > 500:
+                summary = summary[:497] + "..."
+
+            # Apply keyword filter if specified
+            if keywords:
+                text_to_check = f"{title} {summary}".lower()
+                if not any(kw in text_to_check for kw in keywords):
+                    state.mark_rss_item_seen(feed_url, item_id)
+                    continue
+
+            # Create event
+            event = MonitorEvent(
+                source_type='rss',
+                source_name=feed_name,
+                title=title,
+                body=summary,
+                timestamp=pub_date or now,
+                severity='info',
+                url=link,
+                metadata={
+                    'id': item_id.encode() if isinstance(item_id, str) else item_id,
+                    'feed_url': feed_url,
+                    'author': getattr(entry, 'author', '')
+                }
+            )
+            events.append(event)
+            state.mark_rss_item_seen(feed_url, item_id)
+            items_found += 1
+            logger.info(f"New RSS item from '{feed_name}': {title}")
+
+        # Cleanup old items to prevent unbounded growth
+        state.cleanup_old_rss_items(feed_url)
+
+    return events
+
+
+def test_rss_feed(feed_url: str) -> Tuple[bool, str]:
+    """
+    Test an RSS feed URL.
+
+    Args:
+        feed_url: URL of the RSS/Atom feed.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    if not FEEDPARSER_AVAILABLE:
+        return False, "feedparser library not installed (pip install feedparser)"
+
+    success, feed, error = fetch_rss_feed(feed_url)
+    if not success:
+        return False, error
+
+    entry_count = len(feed.entries)
+    feed_title = feed.feed.get('title', 'Unknown')
+    return True, f"Feed '{feed_title}' has {entry_count} entries"
+
+
+# =============================================================================
+# Web Page Change Detection
+# =============================================================================
+
+def fetch_web_page(
+    url: str,
+    css_selector: Optional[str] = None,
+    session: Optional[requests.Session] = None
+) -> Tuple[bool, str, str]:
+    """
+    Fetch a web page and optionally extract content using a CSS selector.
+
+    Args:
+        url: URL of the web page.
+        css_selector: Optional CSS selector to extract specific content.
+        session: Optional requests session.
+
+    Returns:
+        Tuple of (success, content, error_message).
+    """
+    if not validate_url(url):
+        return False, "", f"Invalid URL: {url}"
+
+    try:
+        http_session = session or create_http_session()
+        response = http_session.get(url, timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
+
+        content = response.text
+
+        # Extract specific content if selector provided
+        if css_selector and BS4_AVAILABLE:
+            try:
+                soup = BeautifulSoup(content, 'html.parser')
+                elements = soup.select(css_selector)
+                if elements:
+                    content = '\n'.join(elem.get_text(strip=True) for elem in elements)
+                else:
+                    return False, "", f"CSS selector '{css_selector}' matched no elements"
+            except Exception as e:
+                return False, "", f"CSS selector error: {e}"
+
+        return True, content, ""
+    except requests.RequestException as e:
+        return False, "", f"Failed to fetch page: {e}"
+    except Exception as e:
+        return False, "", f"Error: {e}"
+
+
+def compute_content_hash(content: str) -> str:
+    """Compute SHA256 hash of content."""
+    return hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+
+def check_web_pages(
+    config: WebMonitorConfig,
+    state: MonitorState,
+    session: Optional[requests.Session] = None
+) -> List[MonitorEvent]:
+    """
+    Check web pages for changes.
+
+    Args:
+        config: Web monitor configuration.
+        state: Monitor state for tracking page hashes.
+        session: Optional requests session.
+
+    Returns:
+        List of MonitorEvent objects for changed pages.
+    """
+    if not config.enabled or not config.pages:
+        return []
+
+    events = []
+
+    for page_config in config.pages:
+        url = page_config.get('url', '')
+        name = page_config.get('name', url)
+        css_selector = page_config.get('selector', None)
+        notify_on_error = page_config.get('notify_on_error', True)
+
+        if not url:
+            continue
+
+        success, content, error = fetch_web_page(url, css_selector, session)
+
+        if not success:
+            if notify_on_error:
+                # Check if this is a new error (status changed from OK)
+                last_status = state.get_http_status(url)
+                if last_status and last_status.get('ok', True):
+                    event = MonitorEvent(
+                        source_type='web',
+                        source_name=name,
+                        title=f"Page Error: {name}",
+                        body=f"Failed to fetch page: {error}",
+                        severity='error',
+                        url=url,
+                        metadata={'error': error}
+                    )
+                    events.append(event)
+                    logger.warning(f"Web page '{name}' error: {error}")
+            state.set_http_status(url, {'ok': False, 'error': error})
+            continue
+
+        # Compute hash of content
+        content_hash = compute_content_hash(content)
+        previous_hash = state.get_web_page_hash(url)
+
+        if previous_hash is None:
+            # First time seeing this page, store hash but don't notify
+            state.set_web_page_hash(url, content_hash)
+            state.set_http_status(url, {'ok': True})
+            logger.info(f"Web page '{name}' - initial hash stored")
+            continue
+
+        if content_hash != previous_hash:
+            # Page changed
+            event = MonitorEvent(
+                source_type='web',
+                source_name=name,
+                title=f"Page Changed: {name}",
+                body=f"The monitored page has been updated.",
+                severity='info',
+                url=url,
+                metadata={
+                    'id': content_hash.encode(),
+                    'previous_hash': previous_hash,
+                    'new_hash': content_hash
+                }
+            )
+            events.append(event)
+            state.set_web_page_hash(url, content_hash)
+            logger.info(f"Web page '{name}' changed")
+
+        state.set_http_status(url, {'ok': True})
+
+    return events
+
+
+# =============================================================================
+# HTTP Endpoint Monitoring
+# =============================================================================
+
+def check_http_endpoint(
+    url: str,
+    method: str = 'GET',
+    expected_status: int = 200,
+    expected_text: Optional[str] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+    session: Optional[requests.Session] = None
+) -> Tuple[bool, int, float, str]:
+    """
+    Check an HTTP endpoint.
+
+    Args:
+        url: Endpoint URL.
+        method: HTTP method.
+        expected_status: Expected HTTP status code.
+        expected_text: Optional text that should be in response.
+        timeout: Request timeout.
+        session: Optional requests session.
+
+    Returns:
+        Tuple of (success, status_code, response_time, error_message).
+    """
+    if not validate_url(url):
+        return False, 0, 0.0, f"Invalid URL: {url}"
+
+    try:
+        http_session = session or create_http_session()
+        start_time = time.time()
+        response = http_session.request(method.upper(), url, timeout=timeout)
+        response_time = time.time() - start_time
+
+        status_ok = response.status_code == expected_status
+        text_ok = True
+
+        if expected_text and expected_text not in response.text:
+            text_ok = False
+
+        if status_ok and text_ok:
+            return True, response.status_code, response_time, ""
+        elif not status_ok:
+            return False, response.status_code, response_time, f"Expected status {expected_status}, got {response.status_code}"
+        else:
+            return False, response.status_code, response_time, f"Expected text not found in response"
+
+    except requests.Timeout:
+        return False, 0, timeout, f"Request timed out after {timeout}s"
+    except requests.RequestException as e:
+        return False, 0, 0.0, f"Request failed: {e}"
+    except Exception as e:
+        return False, 0, 0.0, f"Error: {e}"
+
+
+def check_http_endpoints(
+    config: HttpEndpointConfig,
+    state: MonitorState,
+    session: Optional[requests.Session] = None
+) -> List[MonitorEvent]:
+    """
+    Check HTTP endpoints for availability and status.
+
+    Args:
+        config: HTTP endpoint configuration.
+        state: Monitor state for tracking endpoint status.
+        session: Optional requests session.
+
+    Returns:
+        List of MonitorEvent objects for status changes.
+    """
+    if not config.enabled or not config.endpoints:
+        return []
+
+    events = []
+
+    for endpoint_config in config.endpoints:
+        url = endpoint_config.get('url', '')
+        name = endpoint_config.get('name', url)
+        method = endpoint_config.get('method', 'GET')
+        expected_status = endpoint_config.get('expected_status', 200)
+        expected_text = endpoint_config.get('expected_text', None)
+        timeout = endpoint_config.get('timeout', DEFAULT_TIMEOUT)
+
+        if not url:
+            continue
+
+        success, status_code, response_time, error = check_http_endpoint(
+            url, method, expected_status, expected_text, timeout, session
+        )
+
+        # Get previous status
+        last_status = state.get_http_status(f"http:{url}")
+        was_ok = last_status.get('ok', True) if last_status else True
+
+        # Detect status changes
+        if success and not was_ok:
+            # Recovered
+            event = MonitorEvent(
+                source_type='http',
+                source_name=name,
+                title=f"Endpoint Recovered: {name}",
+                body=f"Endpoint is back online. Status: {status_code}, Response time: {response_time:.2f}s",
+                severity='info',
+                url=url,
+                metadata={
+                    'id': f"recovery-{datetime.now().isoformat()}".encode(),
+                    'status_code': status_code,
+                    'response_time': response_time
+                }
+            )
+            events.append(event)
+            logger.info(f"HTTP endpoint '{name}' recovered")
+
+        elif not success and was_ok:
+            # New failure
+            event = MonitorEvent(
+                source_type='http',
+                source_name=name,
+                title=f"Endpoint Down: {name}",
+                body=f"Endpoint check failed: {error}",
+                severity='error',
+                url=url,
+                metadata={
+                    'id': f"failure-{datetime.now().isoformat()}".encode(),
+                    'status_code': status_code,
+                    'error': error
+                }
+            )
+            events.append(event)
+            logger.warning(f"HTTP endpoint '{name}' down: {error}")
+
+        # Update state
+        state.set_http_status(f"http:{url}", {
+            'ok': success,
+            'status_code': status_code,
+            'response_time': response_time,
+            'error': error if not success else None,
+            'last_check': datetime.now().isoformat()
+        })
+
+    return events
+
+
+def test_http_endpoint(url: str, method: str = 'GET', expected_status: int = 200) -> Tuple[bool, str]:
+    """
+    Test an HTTP endpoint.
+
+    Args:
+        url: Endpoint URL.
+        method: HTTP method.
+        expected_status: Expected status code.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    success, status_code, response_time, error = check_http_endpoint(
+        url, method, expected_status
+    )
+
+    if success:
+        return True, f"Endpoint OK - Status: {status_code}, Response time: {response_time:.2f}s"
+    else:
+        return False, f"Endpoint check failed: {error}"
