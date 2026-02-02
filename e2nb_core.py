@@ -765,7 +765,8 @@ def load_config(config_file: str = CONFIG_FILE_PATH) -> configparser.ConfigParse
     Raises:
         ConfigurationError: If configuration cannot be loaded.
     """
-    config = configparser.ConfigParser()
+    # Disable interpolation to allow % characters in passwords/tokens
+    config = configparser.ConfigParser(interpolation=None)
 
     try:
         if not os.path.exists(config_file):
@@ -803,7 +804,8 @@ def create_default_config(config_file: str = CONFIG_FILE_PATH) -> None:
     Args:
         config_file: Path to the configuration file.
     """
-    config = configparser.ConfigParser()
+    # Disable interpolation to allow % characters in passwords/tokens
+    config = configparser.ConfigParser(interpolation=None)
 
     config['Email'] = {
         'protocol': 'imap',
@@ -1526,6 +1528,26 @@ def mark_as_read(imap: imaplib.IMAP4_SSL, email_id: bytes) -> bool:
         return True
     except Exception as e:
         logger.error(f"Failed to mark email {email_id.decode()} as read: {e}")
+        return False
+
+
+def mark_as_read_by_uid(imap: imaplib.IMAP4_SSL, uid: int) -> bool:
+    """
+    Mark an email as read on the IMAP server using UID.
+
+    Args:
+        imap: Authenticated IMAP connection.
+        uid: The email UID to mark as read.
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    try:
+        imap.uid('store', str(uid), '+FLAGS', '\\Seen')
+        logger.info(f"Marked email UID {uid} as read")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to mark email UID {uid} as read: {e}")
         return False
 
 
@@ -3250,6 +3272,8 @@ def test_smtp_receiver_port(host: str, port: int) -> Tuple[bool, str]:
     """
     Test if an SMTP receiver can bind to the given host:port.
 
+    Supports both IPv4 and IPv6 addresses.
+
     Args:
         host: Hostname to bind to.
         port: Port to bind to.
@@ -3259,11 +3283,21 @@ def test_smtp_receiver_port(host: str, port: int) -> Tuple[bool, str]:
     """
     import socket
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Use getaddrinfo to resolve the host and determine address family
+        # This properly handles IPv4, IPv6, and hostnames
+        addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        if not addr_info:
+            return False, f"Cannot resolve host: {host}"
+
+        # Try the first address family returned
+        family, socktype, proto, canonname, sockaddr = addr_info[0]
+        sock = socket.socket(family, socktype, proto)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.settimeout(2)
-        sock.bind((host, port))
+        sock.bind(sockaddr)
         sock.close()
         return True, f"Port {port} is available"
+    except socket.gaierror as e:
+        return False, f"Cannot resolve host {host}: {e}"
     except OSError as e:
         return False, f"Cannot bind to {host}:{port}: {e}"
