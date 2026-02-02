@@ -37,6 +37,13 @@ from e2nb_core import (
     NotificationDispatcher,
     NotificationResult,
     EmailConfig,
+    RssFeedConfig,
+    WebMonitorConfig,
+    HttpEndpointConfig,
+    MonitorState,
+    check_rss_feeds,
+    check_web_pages,
+    check_http_endpoints,
     ConfigurationError,
     DEFAULT_CHECK_INTERVAL,
     DEFAULT_IMAP_PORT,
@@ -204,6 +211,25 @@ class EmailMonitorDaemon:
 
     def _monitor_loop(self):
         """Main monitoring loop."""
+        # Initialize state for monitoring sources
+        monitor_state = MonitorState()
+
+        # Load monitoring source configs
+        rss_config = RssFeedConfig.from_config(self.config)
+        web_config = WebMonitorConfig.from_config(self.config)
+        http_config = HttpEndpointConfig.from_config(self.config)
+
+        # Log enabled sources
+        sources = []
+        if rss_config.enabled:
+            sources.append(f"RSS ({len(rss_config.feeds)} feeds)")
+        if web_config.enabled:
+            sources.append(f"Web ({len(web_config.pages)} pages)")
+        if http_config.enabled:
+            sources.append(f"HTTP ({len(http_config.endpoints)} endpoints)")
+        if sources:
+            logging.info(f"Enabled monitoring sources: {', '.join(sources)}")
+
         while not self.stop_event.is_set():
             imap = None
             try:
@@ -217,7 +243,9 @@ class EmailMonitorDaemon:
                     if f.strip()
                 ]
 
-                # Connect to IMAP server
+                # =====================================================
+                # Check Email (IMAP)
+                # =====================================================
                 imap = connect_to_imap(
                     self.config.get('Email', 'imap_server'),
                     int(self.config.get('Email', 'imap_port', fallback=str(DEFAULT_IMAP_PORT))),
@@ -225,29 +253,63 @@ class EmailMonitorDaemon:
                     self.config.get('Email', 'password')
                 )
 
-                if not imap:
-                    logging.warning(
-                        f"Failed to connect to IMAP server. "
-                        f"Retrying in {check_interval} seconds..."
-                    )
-                    self.stop_event.wait(check_interval)
-                    continue
+                if imap:
+                    unread_emails = fetch_unread_emails(imap)
+                    email_count = len(unread_emails)
 
-                # Fetch unread emails
-                unread_emails = fetch_unread_emails(imap)
-                email_count = len(unread_emails)
+                    if email_count > 0:
+                        logging.info(f"Found {email_count} unread email(s)")
+                    else:
+                        logging.debug("No unread emails found")
 
-                if email_count > 0:
-                    logging.info(f"Found {email_count} unread email(s)")
+                    for email_id, msg in unread_emails:
+                        if self.stop_event.is_set():
+                            break
+                        self._process_email(imap, email_id, msg, filter_emails)
                 else:
-                    logging.debug("No unread emails found")
+                    logging.warning("Failed to connect to IMAP server")
 
-                # Process each email
-                for email_id, msg in unread_emails:
-                    if self.stop_event.is_set():
-                        break
+                # =====================================================
+                # Check RSS Feeds
+                # =====================================================
+                if rss_config.enabled:
+                    rss_events = check_rss_feeds(rss_config, monitor_state)
+                    for event in rss_events:
+                        if self.stop_event.is_set():
+                            break
+                        logging.info(f"[RSS] New item from '{event.source_name}': {event.title}")
+                        notification = event.to_email_notification()
+                        self._dispatch_notification(notification)
 
-                    self._process_email(imap, email_id, msg, filter_emails)
+                # =====================================================
+                # Check Web Pages
+                # =====================================================
+                if web_config.enabled:
+                    web_events = check_web_pages(web_config, monitor_state)
+                    for event in web_events:
+                        if self.stop_event.is_set():
+                            break
+                        logging.info(f"[Web] {event.title}")
+                        notification = event.to_email_notification()
+                        self._dispatch_notification(notification)
+
+                # =====================================================
+                # Check HTTP Endpoints
+                # =====================================================
+                if http_config.enabled:
+                    http_events = check_http_endpoints(http_config, monitor_state)
+                    for event in http_events:
+                        if self.stop_event.is_set():
+                            break
+                        if event.severity == 'error':
+                            logging.warning(f"[HTTP] {event.title}")
+                        else:
+                            logging.info(f"[HTTP] {event.title}")
+                        notification = event.to_email_notification()
+                        self._dispatch_notification(notification)
+
+                # Save monitoring state
+                monitor_state.save()
 
             except Exception as e:
                 logging.error(f"Error in monitoring loop: {e}", exc_info=True)
@@ -267,6 +329,19 @@ class EmailMonitorDaemon:
                     )
                     logging.debug(f"Sleeping for {check_interval} seconds")
                     self.stop_event.wait(check_interval)
+
+    def _dispatch_notification(self, notification: EmailNotification):
+        """
+        Dispatch a notification to all enabled channels.
+
+        Args:
+            notification: The notification to dispatch.
+        """
+        results = self.dispatcher.dispatch(notification, callback=self._on_notification_result)
+        success_count = sum(1 for r in results if r.success)
+        failure_count = len(results) - success_count
+        if results:
+            logging.info(f"Notifications sent: {success_count} success, {failure_count} failed")
 
     def _process_email(self, imap, email_id: bytes, msg, filter_emails: list):
         """
@@ -501,6 +576,19 @@ def test_configuration(config_file: str) -> bool:
     ]
 
     for name, section, key in methods:
+        enabled = daemon.config.getboolean(section, key, fallback=False)
+        status = "ENABLED" if enabled else "disabled"
+        print(f"  {name}: {status}")
+
+    # Show enabled monitoring sources
+    print("\nEnabled monitoring sources:")
+    sources = [
+        ('RSS Feeds', 'RSS', 'enabled'),
+        ('Web Pages', 'WebMonitor', 'enabled'),
+        ('HTTP Endpoints', 'HttpMonitor', 'enabled'),
+    ]
+
+    for name, section, key in sources:
         enabled = daemon.config.getboolean(section, key, fallback=False)
         status = "ENABLED" if enabled else "disabled"
         print(f"  {name}: {status}")
