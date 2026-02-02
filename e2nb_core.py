@@ -425,77 +425,209 @@ class RssFeedConfig:
 
 @dataclass
 class WebMonitorConfig:
-    """Web page change detection configuration."""
+    """
+    Web page change detection configuration.
+
+    Supports two configuration formats:
+
+    1. JSON array in [WebMonitor] section:
+       pages = [{"name": "Example", "url": "https://example.com", "selector": ".content"}]
+
+    2. Individual sections (recommended for clarity):
+       [WebMonitor.example_page]
+       url = https://example.com
+       selector = .content
+    """
     enabled: bool = False
     pages: List[Dict[str, Any]] = field(default_factory=list)
     check_interval: int = DEFAULT_WEB_CHECK_INTERVAL
+    notify_on_first_check: bool = False  # Send notification when baseline is recorded
 
     @classmethod
     def from_config(cls, config: configparser.ConfigParser) -> 'WebMonitorConfig':
         """Create WebMonitorConfig from ConfigParser."""
-        if 'WebMonitor' not in config:
-            return cls()
-        section = config['WebMonitor']
-
-        # Parse pages from JSON string
-        pages_str = section.get('pages', '[]')
         pages = []
-        try:
-            parsed = json.loads(pages_str)
-            if isinstance(parsed, list):
-                # Validate each page has required fields
-                for page in parsed:
-                    if isinstance(page, dict) and 'url' in page:
-                        pages.append(page)
-                    else:
-                        logger.warning(f"Invalid web page entry (missing 'url'): {page}")
-            else:
-                logger.warning("WebMonitor pages config must be a JSON array")
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse WebMonitor pages JSON: {e}")
 
+        # Method 1: Parse pages from JSON string in [WebMonitor] section
+        if 'WebMonitor' in config:
+            section = config['WebMonitor']
+            pages_str = section.get('pages', '[]')
+            try:
+                parsed = json.loads(pages_str)
+                if isinstance(parsed, list):
+                    for page in parsed:
+                        if isinstance(page, dict) and 'url' in page:
+                            pages.append(page)
+                        elif page:  # Skip empty entries silently
+                            logger.warning(f"Invalid web page entry (missing 'url'): {page}")
+                elif pages_str.strip() not in ('[]', ''):
+                    logger.warning("WebMonitor pages config must be a JSON array")
+            except json.JSONDecodeError as e:
+                if pages_str.strip() not in ('[]', ''):
+                    logger.error(f"Failed to parse WebMonitor pages JSON: {e}")
+
+        # Method 2: Parse individual [WebMonitor.name] sections (user-friendly format)
+        for section_name in config.sections():
+            if section_name.startswith('WebMonitor.'):
+                page_name = section_name[len('WebMonitor.'):]
+                section = config[section_name]
+                url = section.get('url', '').strip()
+
+                if not url:
+                    logger.warning(f"Section [{section_name}] missing 'url' - skipping")
+                    continue
+
+                page_config = {
+                    'name': section.get('name', page_name),  # Default to section suffix
+                    'url': url,
+                }
+
+                # Optional fields
+                if section.get('selector'):
+                    page_config['selector'] = section.get('selector')
+                if section.get('headers'):
+                    try:
+                        page_config['headers'] = json.loads(section.get('headers'))
+                    except json.JSONDecodeError:
+                        logger.warning(f"Invalid headers JSON in [{section_name}]")
+                if section.get('notify_on_error'):
+                    page_config['notify_on_error'] = section.getboolean('notify_on_error', fallback=True)
+                if section.get('timeout'):
+                    page_config['timeout'] = safe_int(section.get('timeout'), DEFAULT_TIMEOUT, min_val=1, max_val=300)
+
+                pages.append(page_config)
+                logger.debug(f"Loaded web page monitor: {page_config['name']} -> {url}")
+
+        main_section = config['WebMonitor'] if 'WebMonitor' in config else {}
         return cls(
-            enabled=section.getboolean('enabled', fallback=False),
+            enabled=main_section.get('enabled', 'false').lower() == 'true' if isinstance(main_section, dict) else main_section.getboolean('enabled', fallback=False),
             pages=pages,
-            check_interval=safe_int(section.get('check_interval'), DEFAULT_WEB_CHECK_INTERVAL, min_val=60, max_val=86400)
+            check_interval=safe_int(main_section.get('check_interval') if main_section else None, DEFAULT_WEB_CHECK_INTERVAL, min_val=60, max_val=86400),
+            notify_on_first_check=main_section.get('notify_on_first_check', 'false').lower() == 'true' if isinstance(main_section, dict) else main_section.getboolean('notify_on_first_check', fallback=False)
         )
 
 
 @dataclass
 class HttpEndpointConfig:
-    """HTTP endpoint monitoring configuration."""
+    """
+    HTTP endpoint monitoring configuration.
+
+    Supports two configuration formats:
+
+    1. JSON array in [HttpMonitor] section:
+       endpoints = [{"name": "API", "url": "https://api.example.com/health"}]
+
+    2. Individual sections (recommended for clarity):
+       [HttpMonitor.api_health]
+       url = https://api.example.com/health
+       method = GET
+       expected_status = 200
+
+    Supported endpoint options:
+    - url: Endpoint URL (required)
+    - name: Display name (defaults to section name or URL)
+    - method: HTTP method (GET, POST, PUT, DELETE, etc.)
+    - expected_status: Expected HTTP status code (default: 200)
+    - expected_text: Text that must appear in response body
+    - expected_text_regex: Regex pattern to match in response body
+    - timeout: Request timeout in seconds (default: 30)
+    - headers: JSON object of HTTP headers (e.g., {"Authorization": "Bearer token"})
+    - body: Request body for POST/PUT requests
+    - basic_auth_user: Username for HTTP Basic Authentication
+    - basic_auth_pass: Password for HTTP Basic Authentication
+    - failure_threshold: Number of consecutive failures before alerting (default: 1)
+    - verify_ssl: Whether to verify SSL certificates (default: true)
+    """
     enabled: bool = False
     endpoints: List[Dict[str, Any]] = field(default_factory=list)
     check_interval: int = 60
+    notify_on_first_check: bool = False  # Send notification when monitoring starts
+    default_failure_threshold: int = 1  # Alert on first failure by default
 
     @classmethod
     def from_config(cls, config: configparser.ConfigParser) -> 'HttpEndpointConfig':
         """Create HttpEndpointConfig from ConfigParser."""
-        if 'HttpMonitor' not in config:
-            return cls()
-        section = config['HttpMonitor']
-
-        # Parse endpoints from JSON string
-        endpoints_str = section.get('endpoints', '[]')
         endpoints = []
-        try:
-            parsed = json.loads(endpoints_str)
-            if isinstance(parsed, list):
-                # Validate each endpoint has required fields
-                for endpoint in parsed:
-                    if isinstance(endpoint, dict) and 'url' in endpoint:
-                        endpoints.append(endpoint)
-                    else:
-                        logger.warning(f"Invalid HTTP endpoint entry (missing 'url'): {endpoint}")
-            else:
-                logger.warning("HttpMonitor endpoints config must be a JSON array")
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse HttpMonitor endpoints JSON: {e}")
 
+        # Method 1: Parse endpoints from JSON string in [HttpMonitor] section
+        if 'HttpMonitor' in config:
+            section = config['HttpMonitor']
+            endpoints_str = section.get('endpoints', '[]')
+            try:
+                parsed = json.loads(endpoints_str)
+                if isinstance(parsed, list):
+                    for endpoint in parsed:
+                        if isinstance(endpoint, dict) and 'url' in endpoint:
+                            endpoints.append(endpoint)
+                        elif endpoint:  # Skip empty entries silently
+                            logger.warning(f"Invalid HTTP endpoint entry (missing 'url'): {endpoint}")
+                elif endpoints_str.strip() not in ('[]', ''):
+                    logger.warning("HttpMonitor endpoints config must be a JSON array")
+            except json.JSONDecodeError as e:
+                if endpoints_str.strip() not in ('[]', ''):
+                    logger.error(f"Failed to parse HttpMonitor endpoints JSON: {e}")
+
+        # Method 2: Parse individual [HttpMonitor.name] sections (user-friendly format)
+        for section_name in config.sections():
+            if section_name.startswith('HttpMonitor.'):
+                endpoint_name = section_name[len('HttpMonitor.'):]
+                section = config[section_name]
+                url = section.get('url', '').strip()
+
+                if not url:
+                    logger.warning(f"Section [{section_name}] missing 'url' - skipping")
+                    continue
+
+                endpoint_config = {
+                    'name': section.get('name', endpoint_name),  # Default to section suffix
+                    'url': url,
+                    'method': section.get('method', 'GET').upper(),
+                    'expected_status': safe_int(section.get('expected_status'), 200, min_val=100, max_val=599),
+                    'timeout': safe_int(section.get('timeout'), DEFAULT_TIMEOUT, min_val=1, max_val=300),
+                }
+
+                # Optional text matching
+                if section.get('expected_text'):
+                    endpoint_config['expected_text'] = section.get('expected_text')
+                if section.get('expected_text_regex'):
+                    endpoint_config['expected_text_regex'] = section.get('expected_text_regex')
+
+                # Optional headers (JSON format)
+                if section.get('headers'):
+                    try:
+                        endpoint_config['headers'] = json.loads(section.get('headers'))
+                    except json.JSONDecodeError:
+                        logger.warning(f"Invalid headers JSON in [{section_name}]")
+
+                # Optional request body
+                if section.get('body'):
+                    endpoint_config['body'] = section.get('body')
+
+                # Optional Basic Auth
+                if section.get('basic_auth_user'):
+                    endpoint_config['basic_auth_user'] = section.get('basic_auth_user')
+                    endpoint_config['basic_auth_pass'] = section.get('basic_auth_pass', '')
+
+                # Optional failure threshold
+                if section.get('failure_threshold'):
+                    endpoint_config['failure_threshold'] = safe_int(
+                        section.get('failure_threshold'), 1, min_val=1, max_val=100
+                    )
+
+                # Optional SSL verification
+                if section.get('verify_ssl'):
+                    endpoint_config['verify_ssl'] = section.getboolean('verify_ssl', fallback=True)
+
+                endpoints.append(endpoint_config)
+                logger.debug(f"Loaded HTTP endpoint monitor: {endpoint_config['name']} -> {url}")
+
+        main_section = config['HttpMonitor'] if 'HttpMonitor' in config else {}
         return cls(
-            enabled=section.getboolean('enabled', fallback=False),
+            enabled=main_section.get('enabled', 'false').lower() == 'true' if isinstance(main_section, dict) else main_section.getboolean('enabled', fallback=False),
             endpoints=endpoints,
-            check_interval=safe_int(section.get('check_interval'), 60, min_val=10, max_val=86400)
+            check_interval=safe_int(main_section.get('check_interval') if main_section else None, 60, min_val=10, max_val=86400),
+            notify_on_first_check=main_section.get('notify_on_first_check', 'false').lower() == 'true' if isinstance(main_section, dict) else main_section.getboolean('notify_on_first_check', fallback=False),
+            default_failure_threshold=safe_int(main_section.get('default_failure_threshold') if main_section else None, 1, min_val=1, max_val=100)
         )
 
 
@@ -900,17 +1032,37 @@ def create_default_config(config_file: str = CONFIG_FILE_PATH) -> None:
         'max_items_per_check': str(DEFAULT_RSS_MAX_ITEMS)
     }
 
+    # Web page change monitoring - detects content changes on web pages
+    # Use JSON format in 'pages' OR individual [WebMonitor.name] sections
     config['WebMonitor'] = {
         'enabled': 'False',
         'pages': '[]',
-        'check_interval': str(DEFAULT_WEB_CHECK_INTERVAL)
+        'check_interval': str(DEFAULT_WEB_CHECK_INTERVAL),
+        'notify_on_first_check': 'False'
     }
+    # Example section-based config (add to config.ini):
+    # [WebMonitor.product_price]
+    # url = https://example.com/product
+    # selector = .price
+    # timeout = 30
 
+    # HTTP endpoint monitoring - monitors uptime and response validation
+    # Use JSON format in 'endpoints' OR individual [HttpMonitor.name] sections
     config['HttpMonitor'] = {
         'enabled': 'False',
         'endpoints': '[]',
-        'check_interval': '60'
+        'check_interval': '60',
+        'notify_on_first_check': 'False',
+        'default_failure_threshold': '1'
     }
+    # Example section-based config (add to config.ini):
+    # [HttpMonitor.api_health]
+    # url = https://api.example.com/health
+    # method = GET
+    # expected_status = 200
+    # expected_text = "status":"ok"
+    # timeout = 30
+    # failure_threshold = 3
 
     with open(config_file, 'w') as file:
         config.write(file)
@@ -2790,6 +2942,8 @@ def test_rss_feed(feed_url: str) -> Tuple[bool, str]:
 def fetch_web_page(
     url: str,
     css_selector: Optional[str] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = DEFAULT_TIMEOUT,
     session: Optional[requests.Session] = None
 ) -> Tuple[bool, str, str]:
     """
@@ -2798,6 +2952,8 @@ def fetch_web_page(
     Args:
         url: URL of the web page.
         css_selector: Optional CSS selector to extract specific content.
+        headers: Optional HTTP headers dictionary.
+        timeout: Request timeout in seconds.
         session: Optional requests session.
 
     Returns:
@@ -2808,7 +2964,11 @@ def fetch_web_page(
 
     try:
         http_session = session or create_http_session()
-        response = http_session.get(url, timeout=DEFAULT_TIMEOUT)
+        request_kwargs = {'timeout': timeout}
+        if headers:
+            request_kwargs['headers'] = headers
+
+        response = http_session.get(url, **request_kwargs)
         response.raise_for_status()
 
         content = response.text
@@ -2830,11 +2990,13 @@ def fetch_web_page(
                 if elements:
                     content = '\n'.join(elem.get_text(strip=True) for elem in elements)
                 else:
-                    return False, "", f"CSS selector '{css_selector}' matched no elements"
+                    return False, "", f"CSS selector '{css_selector}' matched no elements on page"
             except Exception as e:
                 return False, "", f"CSS selector error: {e}"
 
         return True, content, ""
+    except requests.Timeout:
+        return False, "", f"Request timed out after {timeout}s"
     except requests.RequestException as e:
         return False, "", f"Failed to fetch page: {e}"
     except Exception as e:
@@ -2854,6 +3016,12 @@ def check_web_pages(
     """
     Check web pages for changes.
 
+    Supports:
+    - CSS selector for monitoring specific page elements
+    - Custom headers (e.g., for authenticated pages)
+    - First-check notifications (optional)
+    - Content excerpts in change notifications
+
     Args:
         config: Web monitor configuration.
         state: Monitor state for tracking page hashes.
@@ -2870,22 +3038,32 @@ def check_web_pages(
     for page_config in config.pages:
         url = page_config.get('url', '')
         name = page_config.get('name', url)
-        css_selector = page_config.get('selector', None)
+        css_selector = page_config.get('selector')
+        headers = page_config.get('headers')
+        timeout = page_config.get('timeout', DEFAULT_TIMEOUT)
         notify_on_error = page_config.get('notify_on_error', True)
 
         if not url:
             continue
 
-        success, content, error = fetch_web_page(url, css_selector, session)
+        success, content, error = fetch_web_page(
+            url=url,
+            css_selector=css_selector,
+            headers=headers,
+            timeout=timeout,
+            session=session
+        )
 
         # Use web: prefix to avoid key collision with HTTP endpoint monitor
         state_key = f"web:{url}"
+        last_status = state.get_http_status(state_key)
+        is_first_check = last_status is None
 
         if not success:
             if notify_on_error:
                 # Check if this is a new error (status changed from OK)
-                last_status = state.get_http_status(state_key)
-                if last_status and last_status.get('ok', True):
+                was_ok = last_status.get('ok', True) if last_status else True
+                if was_ok:
                     event = MonitorEvent(
                         source_type='web',
                         source_name=name,
@@ -2897,40 +3075,66 @@ def check_web_pages(
                     )
                     events.append(event)
                     logger.warning(f"Web page '{name}' error: {error}")
-            state.set_http_status(state_key, {'ok': False, 'error': error})
+            state.set_http_status(state_key, {'ok': False, 'error': error, 'last_check': datetime.now().isoformat()})
             continue
 
         # Compute hash of content
         content_hash = compute_content_hash(content)
         previous_hash = state.get_web_page_hash(url)
 
+        # Generate content excerpt for notifications (first 200 chars, cleaned up)
+        content_excerpt = content[:200].strip()
+        if len(content) > 200:
+            content_excerpt += "..."
+
         if previous_hash is None:
-            # First time seeing this page, store hash but don't notify
+            # First time seeing this page
             state.set_web_page_hash(url, content_hash)
-            state.set_http_status(state_key, {'ok': True})
-            logger.info(f"Web page '{name}' - initial hash stored")
+            state.set_http_status(state_key, {'ok': True, 'last_check': datetime.now().isoformat()})
+
+            if config.notify_on_first_check:
+                selector_info = f" (selector: {css_selector})" if css_selector else ""
+                event = MonitorEvent(
+                    source_type='web',
+                    source_name=name,
+                    title=f"Monitoring Started: {name}",
+                    body=f"Web page monitoring active{selector_info}. Baseline recorded.\n\nContent preview:\n{content_excerpt}",
+                    severity='info',
+                    url=url,
+                    metadata={
+                        'id': f"start-{datetime.now().isoformat()}".encode(),
+                        'content_hash': content_hash
+                    }
+                )
+                events.append(event)
+                logger.info(f"Web page '{name}' monitoring started")
+            else:
+                logger.info(f"Web page '{name}' - initial hash stored")
             continue
 
         if content_hash != previous_hash:
-            # Page changed
+            # Page changed - include content excerpt in notification
+            selector_info = f" (monitoring: {css_selector})" if css_selector else ""
             event = MonitorEvent(
                 source_type='web',
                 source_name=name,
                 title=f"Page Changed: {name}",
-                body=f"The monitored page has been updated.",
+                body=f"The monitored content has been updated{selector_info}.\n\nNew content preview:\n{content_excerpt}",
                 severity='info',
                 url=url,
                 metadata={
                     'id': content_hash.encode(),
                     'previous_hash': previous_hash,
-                    'new_hash': content_hash
+                    'new_hash': content_hash,
+                    'content_excerpt': content_excerpt
                 }
             )
             events.append(event)
             state.set_web_page_hash(url, content_hash)
             logger.info(f"Web page '{name}' changed")
 
-        state.set_http_status(state_key, {'ok': True})
+        # Update status (mark as OK, record last check time)
+        state.set_http_status(state_key, {'ok': True, 'last_check': datetime.now().isoformat()})
 
     return events
 
@@ -2944,51 +3148,104 @@ def check_http_endpoint(
     method: str = 'GET',
     expected_status: int = 200,
     expected_text: Optional[str] = None,
+    expected_text_regex: Optional[str] = None,
     timeout: int = DEFAULT_TIMEOUT,
+    headers: Optional[Dict[str, str]] = None,
+    body: Optional[str] = None,
+    basic_auth: Optional[Tuple[str, str]] = None,
+    verify_ssl: bool = True,
     session: Optional[requests.Session] = None
-) -> Tuple[bool, int, float, str]:
+) -> Tuple[bool, int, float, str, str]:
     """
-    Check an HTTP endpoint.
+    Check an HTTP endpoint with full configuration options.
 
     Args:
         url: Endpoint URL.
-        method: HTTP method.
+        method: HTTP method (GET, POST, PUT, DELETE, etc.).
         expected_status: Expected HTTP status code.
-        expected_text: Optional text that should be in response.
-        timeout: Request timeout.
+        expected_text: Optional text that should be in response (substring match).
+        expected_text_regex: Optional regex pattern to match in response.
+        timeout: Request timeout in seconds.
+        headers: Optional HTTP headers dictionary.
+        body: Optional request body for POST/PUT.
+        basic_auth: Optional tuple of (username, password) for Basic Auth.
+        verify_ssl: Whether to verify SSL certificates.
         session: Optional requests session.
 
     Returns:
-        Tuple of (success, status_code, response_time, error_message).
+        Tuple of (success, status_code, response_time, error_message, response_excerpt).
     """
     if not validate_url(url):
-        return False, 0, 0.0, f"Invalid URL: {url}"
+        return False, 0, 0.0, f"Invalid URL: {url}", ""
 
     try:
         http_session = session or create_http_session()
+
+        # Build request kwargs
+        request_kwargs = {
+            'timeout': timeout,
+            'verify': verify_ssl,
+        }
+
+        if headers:
+            request_kwargs['headers'] = headers
+
+        if body:
+            # Auto-detect content type if not set
+            if headers and 'content-type' in {k.lower() for k in headers}:
+                request_kwargs['data'] = body
+            elif body.strip().startswith('{') or body.strip().startswith('['):
+                # Looks like JSON
+                request_kwargs['json'] = json.loads(body) if isinstance(body, str) else body
+            else:
+                request_kwargs['data'] = body
+
+        if basic_auth:
+            request_kwargs['auth'] = basic_auth
+
         start_time = time.time()
-        response = http_session.request(method.upper(), url, timeout=timeout)
+        response = http_session.request(method.upper(), url, **request_kwargs)
         response_time = time.time() - start_time
 
-        status_ok = response.status_code == expected_status
-        text_ok = True
+        # Get response excerpt for notifications
+        response_excerpt = response.text[:500] if response.text else ""
 
+        # Check status code
+        status_ok = response.status_code == expected_status
+
+        # Check expected text (substring match)
+        text_ok = True
         if expected_text and expected_text not in response.text:
             text_ok = False
 
-        if status_ok and text_ok:
-            return True, response.status_code, response_time, ""
-        elif not status_ok:
-            return False, response.status_code, response_time, f"Expected status {expected_status}, got {response.status_code}"
-        else:
-            return False, response.status_code, response_time, f"Expected text not found in response"
+        # Check expected text regex
+        regex_ok = True
+        if expected_text_regex:
+            try:
+                if not re.search(expected_text_regex, response.text, re.MULTILINE | re.DOTALL):
+                    regex_ok = False
+            except re.error as e:
+                return False, response.status_code, response_time, f"Invalid regex pattern: {e}", response_excerpt
 
+        if status_ok and text_ok and regex_ok:
+            return True, response.status_code, response_time, "", response_excerpt
+        elif not status_ok:
+            return False, response.status_code, response_time, f"Expected status {expected_status}, got {response.status_code}", response_excerpt
+        elif not text_ok:
+            return False, response.status_code, response_time, f"Expected text '{expected_text}' not found in response", response_excerpt
+        else:
+            return False, response.status_code, response_time, f"Response did not match regex pattern '{expected_text_regex}'", response_excerpt
+
+    except json.JSONDecodeError as e:
+        return False, 0, 0.0, f"Invalid JSON body: {e}", ""
     except requests.Timeout:
-        return False, 0, timeout, f"Request timed out after {timeout}s"
+        return False, 0, float(timeout), f"Request timed out after {timeout}s", ""
+    except requests.exceptions.SSLError as e:
+        return False, 0, 0.0, f"SSL error: {e}", ""
     except requests.RequestException as e:
-        return False, 0, 0.0, f"Request failed: {e}"
+        return False, 0, 0.0, f"Request failed: {e}", ""
     except Exception as e:
-        return False, 0, 0.0, f"Error: {e}"
+        return False, 0, 0.0, f"Error: {e}", ""
 
 
 def check_http_endpoints(
@@ -2998,6 +3255,12 @@ def check_http_endpoints(
 ) -> List[MonitorEvent]:
     """
     Check HTTP endpoints for availability and status.
+
+    Supports:
+    - Failure thresholds (only alert after N consecutive failures)
+    - First-check notifications (optional)
+    - Custom headers, body, and authentication
+    - Regex pattern matching for response validation
 
     Args:
         config: HTTP endpoint configuration.
@@ -3017,83 +3280,174 @@ def check_http_endpoints(
         name = endpoint_config.get('name', url)
         method = endpoint_config.get('method', 'GET')
         expected_status = endpoint_config.get('expected_status', 200)
-        expected_text = endpoint_config.get('expected_text', None)
+        expected_text = endpoint_config.get('expected_text')
+        expected_text_regex = endpoint_config.get('expected_text_regex')
         timeout = endpoint_config.get('timeout', DEFAULT_TIMEOUT)
+        headers = endpoint_config.get('headers')
+        body = endpoint_config.get('body')
+        verify_ssl = endpoint_config.get('verify_ssl', True)
+        failure_threshold = endpoint_config.get('failure_threshold', config.default_failure_threshold)
+
+        # Extract basic auth if configured
+        basic_auth = None
+        if endpoint_config.get('basic_auth_user'):
+            basic_auth = (
+                endpoint_config.get('basic_auth_user'),
+                endpoint_config.get('basic_auth_pass', '')
+            )
 
         if not url:
             continue
 
-        success, status_code, response_time, error = check_http_endpoint(
-            url, method, expected_status, expected_text, timeout, session
+        success, status_code, response_time, error, response_excerpt = check_http_endpoint(
+            url=url,
+            method=method,
+            expected_status=expected_status,
+            expected_text=expected_text,
+            expected_text_regex=expected_text_regex,
+            timeout=timeout,
+            headers=headers,
+            body=body,
+            basic_auth=basic_auth,
+            verify_ssl=verify_ssl,
+            session=session
         )
 
         # Get previous status
-        last_status = state.get_http_status(f"http:{url}")
+        state_key = f"http:{url}"
+        last_status = state.get_http_status(state_key)
         was_ok = last_status.get('ok', True) if last_status else True
+        consecutive_failures = last_status.get('consecutive_failures', 0) if last_status else 0
+        is_first_check = last_status is None
 
-        # Detect status changes
-        if success and not was_ok:
-            # Recovered
+        # Handle first-check notification
+        if is_first_check and config.notify_on_first_check:
+            if success:
+                event = MonitorEvent(
+                    source_type='http',
+                    source_name=name,
+                    title=f"Monitoring Started: {name}",
+                    body=f"HTTP endpoint monitoring active. Status: {status_code}, Response time: {response_time:.2f}s",
+                    severity='info',
+                    url=url,
+                    metadata={
+                        'id': f"start-{datetime.now().isoformat()}".encode(),
+                        'status_code': status_code,
+                        'response_time': response_time
+                    }
+                )
+                events.append(event)
+                logger.info(f"HTTP endpoint '{name}' monitoring started (OK)")
+            else:
+                event = MonitorEvent(
+                    source_type='http',
+                    source_name=name,
+                    title=f"Monitoring Started (Warning): {name}",
+                    body=f"HTTP endpoint monitoring started but check failed: {error}",
+                    severity='warning',
+                    url=url,
+                    metadata={
+                        'id': f"start-warning-{datetime.now().isoformat()}".encode(),
+                        'status_code': status_code,
+                        'error': error
+                    }
+                )
+                events.append(event)
+                logger.warning(f"HTTP endpoint '{name}' monitoring started with warning: {error}")
+
+        # Track consecutive failures and detect status changes
+        elif success and not was_ok:
+            # Recovered from failure
             event = MonitorEvent(
                 source_type='http',
                 source_name=name,
                 title=f"Endpoint Recovered: {name}",
-                body=f"Endpoint is back online. Status: {status_code}, Response time: {response_time:.2f}s",
+                body=f"Endpoint is back online after {consecutive_failures} failed check(s). Status: {status_code}, Response time: {response_time:.2f}s",
                 severity='info',
                 url=url,
                 metadata={
                     'id': f"recovery-{datetime.now().isoformat()}".encode(),
                     'status_code': status_code,
-                    'response_time': response_time
+                    'response_time': response_time,
+                    'previous_failures': consecutive_failures
                 }
             )
             events.append(event)
+            consecutive_failures = 0
             logger.info(f"HTTP endpoint '{name}' recovered")
 
-        elif not success and was_ok:
-            # New failure
-            event = MonitorEvent(
-                source_type='http',
-                source_name=name,
-                title=f"Endpoint Down: {name}",
-                body=f"Endpoint check failed: {error}",
-                severity='error',
-                url=url,
-                metadata={
-                    'id': f"failure-{datetime.now().isoformat()}".encode(),
-                    'status_code': status_code,
-                    'error': error
-                }
-            )
-            events.append(event)
-            logger.warning(f"HTTP endpoint '{name}' down: {error}")
+        elif not success:
+            consecutive_failures += 1
 
-        # Update state
-        state.set_http_status(f"http:{url}", {
+            # Only alert if threshold is met (and this is a new alert)
+            if consecutive_failures == failure_threshold:
+                severity = 'error' if failure_threshold == 1 else 'warning'
+                event = MonitorEvent(
+                    source_type='http',
+                    source_name=name,
+                    title=f"Endpoint Down: {name}",
+                    body=f"Endpoint check failed ({consecutive_failures} consecutive failure(s)): {error}",
+                    severity=severity,
+                    url=url,
+                    metadata={
+                        'id': f"failure-{datetime.now().isoformat()}".encode(),
+                        'status_code': status_code,
+                        'error': error,
+                        'consecutive_failures': consecutive_failures
+                    }
+                )
+                events.append(event)
+                logger.warning(f"HTTP endpoint '{name}' down (threshold {failure_threshold} met): {error}")
+
+            elif consecutive_failures < failure_threshold:
+                logger.debug(f"HTTP endpoint '{name}' failed ({consecutive_failures}/{failure_threshold}): {error}")
+
+        else:
+            # Success and was already OK - reset failure counter
+            consecutive_failures = 0
+
+        # Update state with consecutive failure tracking
+        state.set_http_status(state_key, {
             'ok': success,
             'status_code': status_code,
             'response_time': response_time,
             'error': error if not success else None,
+            'consecutive_failures': consecutive_failures,
             'last_check': datetime.now().isoformat()
         })
 
     return events
 
 
-def test_http_endpoint(url: str, method: str = 'GET', expected_status: int = 200) -> Tuple[bool, str]:
+def test_http_endpoint(
+    url: str,
+    method: str = 'GET',
+    expected_status: int = 200,
+    headers: Optional[Dict[str, str]] = None,
+    body: Optional[str] = None,
+    basic_auth: Optional[Tuple[str, str]] = None
+) -> Tuple[bool, str]:
     """
-    Test an HTTP endpoint.
+    Test an HTTP endpoint (for configuration validation).
 
     Args:
         url: Endpoint URL.
         method: HTTP method.
         expected_status: Expected status code.
+        headers: Optional HTTP headers.
+        body: Optional request body.
+        basic_auth: Optional (username, password) tuple.
 
     Returns:
         Tuple of (success, message).
     """
-    success, status_code, response_time, error = check_http_endpoint(
-        url, method, expected_status
+    success, status_code, response_time, error, _ = check_http_endpoint(
+        url=url,
+        method=method,
+        expected_status=expected_status,
+        headers=headers,
+        body=body,
+        basic_auth=basic_auth
     )
 
     if success:
