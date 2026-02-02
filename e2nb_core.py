@@ -18,6 +18,7 @@ import configparser
 import hashlib
 import imaplib
 import json
+import poplib
 import logging
 import os
 import re
@@ -136,11 +137,16 @@ class ValidationError(E2NBError):
 # Data Classes for Configuration
 # =============================================================================
 
+DEFAULT_POP3_PORT = 995
+
 @dataclass
 class EmailConfig:
     """Email server configuration."""
+    protocol: str = "imap"  # 'imap' or 'pop3'
     imap_server: str = "imap.gmail.com"
     imap_port: int = DEFAULT_IMAP_PORT
+    pop3_server: str = "pop.gmail.com"
+    pop3_port: int = DEFAULT_POP3_PORT
     username: str = ""
     password: str = ""
     filter_emails: List[str] = field(default_factory=list)
@@ -152,8 +158,11 @@ class EmailConfig:
         filter_str = section.get('filter_emails', '')
         filters = [f.strip().lower() for f in filter_str.split(',') if f.strip()]
         return cls(
+            protocol=section.get('protocol', 'imap').lower(),
             imap_server=section.get('imap_server', 'imap.gmail.com'),
             imap_port=int(section.get('imap_port', DEFAULT_IMAP_PORT)),
+            pop3_server=section.get('pop3_server', 'pop.gmail.com'),
+            pop3_port=int(section.get('pop3_port', str(DEFAULT_POP3_PORT))),
             username=section.get('username', ''),
             password=section.get('password', ''),
             filter_emails=filters
@@ -685,8 +694,11 @@ def create_default_config(config_file: str = CONFIG_FILE_PATH) -> None:
     config = configparser.ConfigParser()
 
     config['Email'] = {
+        'protocol': 'imap',
         'imap_server': 'imap.gmail.com',
         'imap_port': str(DEFAULT_IMAP_PORT),
+        'pop3_server': 'pop.gmail.com',
+        'pop3_port': str(DEFAULT_POP3_PORT),
         'username': '',
         'password': '',
         'filter_emails': ''
@@ -915,6 +927,129 @@ def fetch_unread_emails(
     except Exception as e:
         logger.error(f"Failed to fetch emails: {e}")
         return []
+
+
+def connect_to_pop3(
+    server: str,
+    port: int,
+    username: str,
+    password: str,
+    timeout: int = DEFAULT_TIMEOUT
+) -> Optional[poplib.POP3_SSL]:
+    """
+    Establish a secure connection to a POP3 server.
+
+    Args:
+        server: POP3 server address.
+        port: POP3 server port.
+        username: Email username.
+        password: Email password.
+        timeout: Connection timeout in seconds.
+
+    Returns:
+        Authenticated POP3 connection or None on failure.
+    """
+    try:
+        pop3 = poplib.POP3_SSL(server, port, timeout=timeout)
+        pop3.user(username)
+        pop3.pass_(password)
+        logger.info(f"Connected to POP3 server {server}:{port}")
+        return pop3
+    except poplib.error_proto as e:
+        logger.error(f"POP3 authentication failed for {server}:{port}: {e}")
+        return None
+    except TimeoutError:
+        logger.error(f"Connection to {server}:{port} timed out")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to connect to POP3 server {server}:{port}: {e}")
+        return None
+
+
+def fetch_pop3_emails(
+    pop3: poplib.POP3_SSL,
+    max_emails: int = MAX_EMAILS_PER_CHECK
+) -> List[Tuple[int, Message]]:
+    """
+    Retrieve emails from a POP3 server.
+
+    POP3 does not have an 'unread' concept, so we fetch the most recent
+    messages. The caller should track which messages have been seen.
+
+    Args:
+        pop3: Authenticated POP3 connection.
+        max_emails: Maximum number of emails to fetch.
+
+    Returns:
+        List of tuples containing (message_number, email_message).
+    """
+    try:
+        count, _ = pop3.stat()
+        if count == 0:
+            return []
+
+        # Fetch most recent messages (highest numbers = newest)
+        start = max(1, count - max_emails + 1)
+        emails = []
+        for msg_num in range(count, start - 1, -1):
+            try:
+                resp, lines, octets = pop3.retr(msg_num)
+                raw = b'\r\n'.join(lines)
+                msg = email_module.message_from_bytes(raw)
+                emails.append((msg_num, msg))
+            except Exception as e:
+                logger.error(f"Failed to fetch POP3 message {msg_num}: {e}")
+
+        return emails
+    except Exception as e:
+        logger.error(f"Failed to fetch POP3 emails: {e}")
+        return []
+
+
+def delete_pop3_message(pop3: poplib.POP3_SSL, msg_num: int) -> bool:
+    """
+    Mark a POP3 message for deletion (deleted on quit).
+
+    Args:
+        pop3: Authenticated POP3 connection.
+        msg_num: Message number to delete.
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    try:
+        pop3.dele(msg_num)
+        logger.info(f"Marked POP3 message {msg_num} for deletion")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to delete POP3 message {msg_num}: {e}")
+        return False
+
+
+def test_pop3_connection(config: EmailConfig) -> Tuple[bool, str]:
+    """
+    Test POP3 connection with provided configuration.
+
+    Args:
+        config: Email configuration to test.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    try:
+        pop3 = connect_to_pop3(
+            config.pop3_server,
+            config.pop3_port,
+            config.username,
+            config.password
+        )
+        if pop3:
+            count, size = pop3.stat()
+            pop3.quit()
+            return True, f"Connected to POP3 server ({count} messages, {size} bytes)"
+        return False, "Failed to connect to POP3 server"
+    except Exception as e:
+        return False, f"POP3 connection error: {e}"
 
 
 def extract_email_body(msg: Message) -> str:

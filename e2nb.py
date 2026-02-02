@@ -54,7 +54,10 @@ from e2nb_core import (
     load_config,
     save_config,
     connect_to_imap,
+    connect_to_pop3,
     fetch_unread_emails,
+    fetch_pop3_emails,
+    delete_pop3_message,
     extract_email_body,
     decode_email_subject,
     get_sender_email,
@@ -72,6 +75,7 @@ from e2nb_core import (
     MonitorState,
     MonitorEvent,
     test_imap_connection,
+    test_pop3_connection,
     test_smtp_connection,
     test_smtp_receiver_port,
     test_rss_feed,
@@ -82,6 +86,7 @@ from e2nb_core import (
     DEFAULT_CHECK_INTERVAL,
     DEFAULT_MAX_SMS_LENGTH,
     DEFAULT_IMAP_PORT,
+    DEFAULT_POP3_PORT,
     FEEDPARSER_AVAILABLE,
     BS4_AVAILABLE,
     AIOSMTPD_AVAILABLE,
@@ -1064,8 +1069,11 @@ class EmailMonitorApp:
 
     # Page metadata: key -> (title, section)
     PAGE_META = {
-        "email":    ("Email Settings",   "Configuration"),
         "settings": ("General Settings", "Configuration"),
+        "email":    ("Email Settings",   "Sources"),
+        "rss":      ("RSS Feeds",        "Sources"),
+        "webmon":   ("Web Pages",        "Sources"),
+        "httpmon":  ("HTTP Endpoints",   "Sources"),
         "sms":      ("Twilio SMS",       "Notifications"),
         "voice":    ("Twilio Voice",     "Notifications"),
         "whatsapp": ("WhatsApp",         "Notifications"),
@@ -1074,9 +1082,6 @@ class EmailMonitorApp:
         "discord":  ("Discord",          "Notifications"),
         "webhook":  ("Custom Webhook",   "Notifications"),
         "smtp":     ("Email (SMTP)",     "Notifications"),
-        "rss":      ("RSS Feeds",        "Sources"),
-        "webmon":   ("Web Pages",        "Sources"),
-        "httpmon":  ("HTTP Endpoints",   "Sources"),
         "logs":     ("Activity Logs",    "Monitor"),
     }
 
@@ -1134,8 +1139,9 @@ class EmailMonitorApp:
         # Handle close
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Initial badge count
+        # Initial badge counts
         self._update_services_badge()
+        self._update_sources_badge()
 
     def _init_variables(self):
         """Initialize tkinter variables."""
@@ -1151,6 +1157,10 @@ class EmailMonitorApp:
 
         # SMTP Receiver
         self.smtp_recv_var = tk.BooleanVar(value=self.config.getboolean('SmtpReceiver', 'enabled', fallback=False))
+
+        # Email source active (has username or SMTP receiver)
+        self.email_source_var = tk.BooleanVar(value=bool(self.config.get('Email', 'username', fallback=''))
+                                              or self.smtp_recv_var.get())
 
         # Monitoring sources
         self.rss_var = tk.BooleanVar(value=self.config.getboolean('RSS', 'enabled', fallback=False))
@@ -1177,7 +1187,7 @@ class EmailMonitorApp:
         ]
 
     def _source_vars(self) -> list:
-        return [self.rss_var, self.webmon_var, self.httpmon_var]
+        return [self.email_source_var, self.rss_var, self.webmon_var, self.httpmon_var]
 
     def _update_services_badge(self):
         if hasattr(self, '_services_badge'):
@@ -1187,7 +1197,7 @@ class EmailMonitorApp:
     def _update_sources_badge(self):
         if hasattr(self, '_sources_badge'):
             count = sum(1 for v in self._source_vars() if v.get())
-            self._sources_badge.update_count(count, total=3)
+            self._sources_badge.update_count(count, total=4)
 
     def _create_layout(self):
         """Create the main layout structure."""
@@ -1270,20 +1280,26 @@ class EmailMonitorApp:
         self._sb_canvas.bind("<Enter>", _enter_sb)
         self._sb_canvas.bind("<Leave>", _leave_sb)
 
-        # Configuration section
-        SidebarSection(nav, "Configuration").pack(fill="x")
+        # Sources section - all monitoring inputs
+        SidebarSection(nav, "Sources").pack(fill="x")
 
-        nav_items = [
-            ("email", "Email Settings", 0, None, "Configure IMAP server and credentials"),
-            ("settings", "General", 0, None, "Monitoring interval and SMS settings"),
+        source_items = [
+            ("email", "Email", 0, self.email_source_var, "Email monitoring via IMAP or POP3"),
+            ("rss", "RSS Feeds", 0, self.rss_var, "Monitor RSS/Atom feeds for new items"),
+            ("webmon", "Web Pages", 0, self.webmon_var, "Detect changes on web pages"),
+            ("httpmon", "HTTP Endpoints", 0, self.httpmon_var, "Monitor API/service availability"),
         ]
-        for key, text, indent, var, tip in nav_items:
+        for key, text, indent, var, tip in source_items:
             item = SidebarItem(
                 nav, text, lambda k=key: self._show_page(k),
                 indent, status_var=var, tooltip=tip,
             )
             item.pack(fill="x")
             self.nav_items[key] = item
+
+        # Sources badge
+        self._sources_badge = SidebarBadge(nav)
+        self._sources_badge.pack(fill="x", pady=(4, 0))
 
         # Notifications section
         SidebarSection(nav, "Notifications").pack(fill="x")
@@ -1310,25 +1326,19 @@ class EmailMonitorApp:
         self._services_badge = SidebarBadge(nav)
         self._services_badge.pack(fill="x", pady=(4, 0))
 
-        # Sources section (additional monitoring sources)
-        SidebarSection(nav, "Sources").pack(fill="x")
+        # Configuration section
+        SidebarSection(nav, "Configuration").pack(fill="x")
 
-        source_items = [
-            ("rss", "RSS Feeds", 0, self.rss_var, "Monitor RSS/Atom feeds for new items"),
-            ("webmon", "Web Pages", 0, self.webmon_var, "Detect changes on web pages"),
-            ("httpmon", "HTTP Endpoints", 0, self.httpmon_var, "Monitor API/service availability"),
+        config_items = [
+            ("settings", "General", 0, None, "Monitoring interval and SMS settings"),
         ]
-        for key, text, indent, var, tip in source_items:
+        for key, text, indent, var, tip in config_items:
             item = SidebarItem(
                 nav, text, lambda k=key: self._show_page(k),
                 indent, status_var=var, tooltip=tip,
             )
             item.pack(fill="x")
             self.nav_items[key] = item
-
-        # Sources badge
-        self._sources_badge = SidebarBadge(nav)
-        self._sources_badge.pack(fill="x", pady=(4, 0))
 
         # Monitor section
         SidebarSection(nav, "Monitor").pack(fill="x")
@@ -1505,31 +1515,81 @@ class EmailMonitorApp:
     def _create_email_page(self):
         page = self._create_scrollable_page("email")
 
-        section = FormSection(page, "IMAP Server", "Configure your email server connection")
-        section.pack(fill="x", pady=(0, 24))
+        # Protocol selection
+        proto_section = FormSection(page, "Protocol", "Choose how to connect to your mail server")
+        proto_section.pack(fill="x", pady=(0, 24))
+
+        proto_frame = tk.Frame(proto_section.content, bg=Theme.BG_PRIMARY)
+        proto_frame.pack(fill="x", padx=16, pady=12)
+
+        self.protocol_var = tk.StringVar(
+            value=self.config.get('Email', 'protocol', fallback='imap').upper()
+        )
+
+        for proto_val, proto_label, proto_desc in [
+            ("IMAP", "IMAP", "Recommended - fetches unread emails, marks as read"),
+            ("POP3", "POP3", "Downloads and deletes emails from server"),
+        ]:
+            rb_frame = tk.Frame(proto_frame, bg=Theme.BG_PRIMARY)
+            rb_frame.pack(fill="x", pady=2)
+            tk.Radiobutton(
+                rb_frame, text=f"{proto_label} - {proto_desc}",
+                variable=self.protocol_var, value=proto_val,
+                bg=Theme.BG_PRIMARY, fg=Theme.TEXT_PRIMARY,
+                selectcolor=Theme.BG_PRIMARY,
+                activebackground=Theme.BG_PRIMARY,
+                activeforeground=Theme.TEXT_PRIMARY,
+                font=(Theme.FONT, 10),
+                command=self._on_protocol_changed,
+            ).pack(anchor="w")
+
+        # IMAP Server settings
+        self._imap_section = FormSection(page, "IMAP Server", "Configure your IMAP server connection")
+        self._imap_section.pack(fill="x", pady=(0, 24))
 
         self.imap_server = FormRow(
-            section.content, "Server", "e.g., imap.gmail.com",
+            self._imap_section.content, "Server", "e.g., imap.gmail.com",
             tooltip="Hostname of your IMAP email server",
         )
         self.imap_server.pack(fill="x")
         self.imap_server.set(self.config.get('Email', 'imap_server', fallback='imap.gmail.com'))
 
-        self._create_separator(section.content)
+        self._create_separator(self._imap_section.content)
 
         self.imap_port = FormRow(
-            section.content, "Port", "Usually 993 for SSL",
+            self._imap_section.content, "Port", "Usually 993 for SSL",
             tooltip="IMAP port number (993 for SSL/TLS)",
         )
         self.imap_port.pack(fill="x")
         self.imap_port.set(self.config.get('Email', 'imap_port', fallback='993'))
 
-        section2 = FormSection(page, "Credentials", "Your email login details")
+        # POP3 Server settings
+        self._pop3_section = FormSection(page, "POP3 Server", "Configure your POP3 server connection")
+        self._pop3_section.pack(fill="x", pady=(0, 24))
+
+        self.pop3_server = FormRow(
+            self._pop3_section.content, "Server", "e.g., pop.gmail.com",
+            tooltip="Hostname of your POP3 email server",
+        )
+        self.pop3_server.pack(fill="x")
+        self.pop3_server.set(self.config.get('Email', 'pop3_server', fallback='pop.gmail.com'))
+
+        self._create_separator(self._pop3_section.content)
+
+        self.pop3_port = FormRow(
+            self._pop3_section.content, "Port", "Usually 995 for SSL",
+            tooltip="POP3 port number (995 for SSL/TLS)",
+        )
+        self.pop3_port.pack(fill="x")
+        self.pop3_port.set(self.config.get('Email', 'pop3_port', fallback='995'))
+
+        # Credentials (shared)
+        self._creds_section = section2 = FormSection(page, "Credentials", "Your email login details")
         section2.pack(fill="x", pady=(0, 24))
 
         self.username = FormRow(
             section2.content, "Email", "Your email address",
-            tooltip="Full email address for IMAP login",
+            tooltip="Full email address for login",
         )
         self.username.pack(fill="x")
         self.username.set(self.config.get('Email', 'username', fallback=''))
@@ -1551,7 +1611,7 @@ class EmailMonitorApp:
             command=self._test_connection,
             bg=Theme.BG_PRIMARY, fg=Theme.TEXT_PRIMARY,
             hover_bg=Theme.BG_TERTIARY,
-            tooltip="Verify IMAP server connection",
+            tooltip="Verify mail server connection",
         ).pack(side="left")
 
         section3 = FormSection(page, "Email Filters", "Only process emails matching these filters (optional)")
@@ -1652,6 +1712,19 @@ class EmailMonitorApp:
             hover_bg=Theme.BG_TERTIARY,
             tooltip="Check if the SMTP receiver port is available",
         ).pack(side="left")
+
+        # Set initial protocol visibility
+        self._on_protocol_changed()
+
+    def _on_protocol_changed(self):
+        """Show/hide IMAP or POP3 settings based on protocol selection."""
+        proto = self.protocol_var.get()
+        if proto == "POP3":
+            self._imap_section.pack_forget()
+            self._pop3_section.pack(fill="x", pady=(0, 24), before=self._creds_section)
+        else:
+            self._pop3_section.pack_forget()
+            self._imap_section.pack(fill="x", pady=(0, 24), before=self._creds_section)
 
     def _test_smtp_receiver_port(self):
         """Test if the SMTP receiver port is available."""
@@ -2381,8 +2454,11 @@ class EmailMonitorApp:
             self._log_empty.place(relx=0.5, rely=0.4, anchor="center")
 
     def _update_config(self):
+        self.config['Email']['protocol'] = self.protocol_var.get().lower()
         self.config['Email']['imap_server'] = self.imap_server.get()
         self.config['Email']['imap_port'] = self.imap_port.get()
+        self.config['Email']['pop3_server'] = self.pop3_server.get()
+        self.config['Email']['pop3_port'] = self.pop3_port.get()
         self.config['Email']['username'] = self.username.get()
         self.config['Email']['password'] = self.password.get()
         self.config['Email']['filter_emails'] = self.filters.get()
@@ -2481,17 +2557,24 @@ class EmailMonitorApp:
             self.toast.show(f"Save failed: {e}", "error")
 
     def _test_connection(self):
-        self._log("Testing connection...", "INFO")
-        self._update_status_bar("Testing IMAP connection...")
+        proto = self.protocol_var.get()
+        self._log(f"Testing {proto} connection...", "INFO")
+        self._update_status_bar(f"Testing {proto} connection...")
 
         def test():
             cfg = EmailConfig(
+                protocol=proto.lower(),
                 imap_server=self.imap_server.get(),
                 imap_port=int(self.imap_port.get() or 993),
+                pop3_server=self.pop3_server.get(),
+                pop3_port=int(self.pop3_port.get() or 995),
                 username=self.username.get(),
                 password=self.password.get()
             )
-            success, msg = test_imap_connection(cfg)
+            if proto == "POP3":
+                success, msg = test_pop3_connection(cfg)
+            else:
+                success, msg = test_imap_connection(cfg)
             self.root.after(0, lambda: self._on_test_result(success, msg))
 
         threading.Thread(target=test, daemon=True).start()
@@ -2510,10 +2593,10 @@ class EmailMonitorApp:
         if not any(v.get() for v in self._service_vars()):
             self.toast.show("Enable at least one notification method.", "error")
             return False
-        has_imap = all([self.imap_server.get(), self.username.get(), self.password.get()])
+        has_email_creds = bool(self.username.get() and self.password.get())
         has_smtp_recv = self.smtp_recv_var.get()
-        if not has_imap and not has_smtp_recv:
-            self.toast.show("Configure IMAP or enable SMTP Receiver.", "error")
+        if not has_email_creds and not has_smtp_recv:
+            self.toast.show("Configure email credentials or enable SMTP Receiver.", "error")
             return False
         return True
 
@@ -2608,6 +2691,7 @@ class EmailMonitorApp:
 
         while not self.stop_event.is_set():
             imap = None
+            pop3 = None
             try:
                 interval = int(self.config.get('Settings', 'check_interval', fallback='60'))
                 filters = [f.strip().lower() for f in self.config.get('Email', 'filter_emails', fallback='').split(',') if f.strip()]
@@ -2618,56 +2702,103 @@ class EmailMonitorApp:
                 ))
 
                 # =====================================================
-                # Check Email (IMAP) - skip if no credentials
+                # Check Email (IMAP or POP3)
                 # =====================================================
-                imap_username = self.config.get('Email', 'username', fallback='')
-                if imap_username:
+                email_username = self.config.get('Email', 'username', fallback='')
+                protocol = self.config.get('Email', 'protocol', fallback='imap').lower()
+                pop3 = None
+
+                if email_username and protocol == 'imap':
                     imap = connect_to_imap(
                         self.config.get('Email', 'imap_server'),
                         int(self.config.get('Email', 'imap_port', fallback='993')),
-                        imap_username,
+                        email_username,
                         self.config.get('Email', 'password')
                     )
-                else:
-                    imap = None
 
-                if imap:
-                    emails = fetch_unread_emails(imap)
-                    if emails:
-                        self._log(f"Found {len(emails)} unread email(s)", "INFO")
+                    if imap:
+                        emails = fetch_unread_emails(imap)
+                        if emails:
+                            self._log(f"Found {len(emails)} unread email(s)", "INFO")
 
-                    for email_id, msg in emails:
-                        if self.stop_event.is_set():
-                            break
+                        for email_id, msg in emails:
+                            if self.stop_event.is_set():
+                                break
 
-                        sender = get_sender_email(msg)
-                        if filters and not check_email_filter(sender, filters):
-                            continue
+                            sender = get_sender_email(msg)
+                            if filters and not check_email_filter(sender, filters):
+                                continue
 
-                        subject = decode_email_subject(msg)
-                        body = extract_email_body(msg)
+                            subject = decode_email_subject(msg)
+                            body = extract_email_body(msg)
 
-                        self._log(f"Processing email: {subject[:40]}...", "INFO")
+                            self._log(f"Processing email: {subject[:40]}...", "INFO")
 
-                        notification = EmailNotification(
-                            email_id=email_id,
-                            sender=sender,
-                            subject=subject,
-                            body=body
-                        )
-
-                        results = dispatcher.dispatch(
-                            notification,
-                            callback=lambda r: self._log(
-                                f"{r.service}: {r.message}",
-                                "SUCCESS" if r.success else "ERROR"
+                            notification = EmailNotification(
+                                email_id=email_id,
+                                sender=sender,
+                                subject=subject,
+                                body=body
                             )
-                        )
 
-                        if any(r.success for r in results):
-                            mark_as_read(imap, email_id)
-                elif imap_username:
-                    self._log("Email connection failed", "WARNING")
+                            results = dispatcher.dispatch(
+                                notification,
+                                callback=lambda r: self._log(
+                                    f"{r.service}: {r.message}",
+                                    "SUCCESS" if r.success else "ERROR"
+                                )
+                            )
+
+                            if any(r.success for r in results):
+                                mark_as_read(imap, email_id)
+                    else:
+                        self._log("IMAP connection failed", "WARNING")
+
+                elif email_username and protocol == 'pop3':
+                    pop3 = connect_to_pop3(
+                        self.config.get('Email', 'pop3_server'),
+                        int(self.config.get('Email', 'pop3_port', fallback='995')),
+                        email_username,
+                        self.config.get('Email', 'password')
+                    )
+
+                    if pop3:
+                        pop3_emails = fetch_pop3_emails(pop3)
+                        if pop3_emails:
+                            self._log(f"Found {len(pop3_emails)} email(s) via POP3", "INFO")
+
+                        for msg_num, msg in pop3_emails:
+                            if self.stop_event.is_set():
+                                break
+
+                            sender = get_sender_email(msg)
+                            if filters and not check_email_filter(sender, filters):
+                                continue
+
+                            subject = decode_email_subject(msg)
+                            body = extract_email_body(msg)
+
+                            self._log(f"Processing email: {subject[:40]}...", "INFO")
+
+                            notification = EmailNotification(
+                                email_id=str(msg_num).encode(),
+                                sender=sender,
+                                subject=subject,
+                                body=body
+                            )
+
+                            results = dispatcher.dispatch(
+                                notification,
+                                callback=lambda r: self._log(
+                                    f"{r.service}: {r.message}",
+                                    "SUCCESS" if r.success else "ERROR"
+                                )
+                            )
+
+                            if any(r.success for r in results):
+                                delete_pop3_message(pop3, msg_num)
+                    else:
+                        self._log("POP3 connection failed", "WARNING")
 
                 # =====================================================
                 # Check RSS Feeds
@@ -2745,6 +2876,11 @@ class EmailMonitorApp:
                 if imap:
                     try:
                         imap.logout()
+                    except Exception:
+                        pass
+                if pop3:
+                    try:
+                        pop3.quit()
                     except Exception:
                         pass
 
