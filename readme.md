@@ -1,6 +1,6 @@
 # E2NB - Email to Notification Blaster
 
-A professional Python application that monitors multiple sources (Email via IMAP/POP3, local SMTP receiver, RSS/Atom feeds, web page changes, HTTP endpoint availability) and forwards notifications through 8 channels: SMS, Voice calls, WhatsApp, Slack, Telegram, Discord, SMTP email forwarding, and custom webhooks.
+A professional Python application that monitors multiple sources (Email via IMAP/POP3, local SMTP receiver, RSS/Atom feeds, web page changes, HTTP endpoint availability) and forwards notifications through 12 channels: SMS, Voice calls, WhatsApp, Slack (channels and DMs), Telegram, Discord, Microsoft Teams, Pushover, Ntfy, SMTP email forwarding, and custom webhooks.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
@@ -15,6 +15,7 @@ A professional Python application that monitors multiple sources (Email via IMAP
 - [Configuration Reference](#configuration-reference)
   - [Email Settings](#email-settings)
   - [Advanced Email Settings](#advanced-email-settings)
+  - [OAuth2 Authentication](#oauth2-authentication)
   - [General Settings](#general-settings)
   - [SMTP Receiver](#smtp-receiver)
   - [RSS Feed Monitoring](#rss-feed-monitoring)
@@ -27,8 +28,12 @@ A professional Python application that monitors multiple sources (Email via IMAP
   - [Slack](#slack)
   - [Telegram](#telegram)
   - [Discord](#discord)
+  - [Microsoft Teams](#microsoft-teams)
+  - [Pushover](#pushover)
+  - [Ntfy](#ntfy)
   - [SMTP Email Forwarding](#smtp-email-forwarding)
   - [Custom Webhook](#custom-webhook)
+- [Notification Routing Rules](#notification-routing-rules)
 - [GUI Version](#gui-version)
 - [Headless Daemon](#headless-daemon)
   - [Command-Line Arguments](#command-line-arguments)
@@ -87,9 +92,9 @@ e2nb/
 
 | Module | Lines | Purpose |
 |--------|-------|---------|
-| `e2nb_core.py` | ~3250 | Configuration management, email operations (IMAP/POP3), SMTP receiver, RSS/Web/HTTP monitoring, all 8 notification channel implementations, input validation, state management, HTTP retry logic |
-| `e2nb.py` | ~3065 | Tkinter GUI with modern dark sidebar, scrollable form pages, real-time log viewer, toggle switches, toast notifications, connection testing |
-| `e2nb-headless.py` | ~825 | CLI daemon with argparse, signal handling (SIGHUP reload), thread-safe config swapping, systemd integration |
+| `e2nb_core.py` | ~4,500 | Configuration management, email operations (IMAP/POP3/OAuth2), SMTP receiver, RSS/Web/HTTP monitoring, all 12 notification channel implementations, notification routing rules, input validation, state management, HTTP retry logic |
+| `e2nb.py` | ~3,350 | Tkinter GUI with modern dark sidebar, scrollable form pages, real-time log viewer, toggle switches, toast notifications, connection testing |
+| `e2nb-headless.py` | ~1,150 | CLI daemon with argparse, signal handling (SIGHUP reload), thread-safe config swapping, systemd integration |
 
 ### Data Flow
 
@@ -100,11 +105,15 @@ Sources                      Core                        Channels
 │ POP3     │──┤           │ Notification │──────────>│ Voice    │
 │ SMTP Recv│──┼──────────>│ Dispatcher   │──────────>│ WhatsApp │
 │ RSS Feeds│──┤           │              │──────────>│ Slack    │
-│ Web Pages│──┤           │ (routes to   │──────────>│ Telegram │
-│ HTTP Endp│──┘           │  all enabled │──────────>│ Discord  │
-└──────────┘              │  channels)   │──────────>│ SMTP     │
-                          │              │──────────>│ Webhook  │
-                          └──────────────┘           └──────────┘
+│ Web Pages│──┤           │ (routes to   │──────────>│ Slack DM │
+│ HTTP Endp│──┘           │  all enabled │──────────>│ Telegram │
+└──────────┘              │  channels    │──────────>│ Discord  │
+                          │  with rules) │──────────>│ Teams    │
+                          │              │──────────>│ Pushover │
+                          └──────────────┘──────────>│ Ntfy     │
+                                         ──────────>│ SMTP     │
+                                         ──────────>│ Webhook  │
+                                                    └──────────┘
 ```
 
 ## Requirements
@@ -225,6 +234,39 @@ connection_timeout = 30
 | `verify_ssl` | Verify SSL/TLS certificates. Set to `False` for self-signed certs. | `True` |
 | `max_emails_per_check` | Maximum number of emails to process per monitoring cycle (1-100) | `5` |
 | `connection_timeout` | Connection timeout in seconds (5-300) | `30` |
+| `ca_bundle` | Path to custom CA certificate bundle for self-signed or internal CA certificates | *(empty)* |
+
+### OAuth2 Authentication
+
+For email providers that require or prefer OAuth2 authentication (like Gmail with advanced security settings or Microsoft 365), E2NB supports OAuth2/XOAUTH2.
+
+```ini
+[Email]
+oauth2_enabled = True
+oauth2_client_id = your-client-id.apps.googleusercontent.com
+oauth2_client_secret = your-client-secret
+oauth2_refresh_token = your-refresh-token
+oauth2_token_url = https://oauth2.googleapis.com/token
+```
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `oauth2_enabled` | Enable OAuth2 authentication instead of password auth | `False` |
+| `oauth2_client_id` | OAuth2 client ID from your provider's developer console | *(empty)* |
+| `oauth2_client_secret` | OAuth2 client secret | *(empty)* |
+| `oauth2_refresh_token` | OAuth2 refresh token (obtained via initial OAuth flow) | *(empty)* |
+| `oauth2_token_url` | Token endpoint URL for your OAuth2 provider | `https://oauth2.googleapis.com/token` |
+
+**Common OAuth2 Token URLs**:
+- **Gmail**: `https://oauth2.googleapis.com/token`
+- **Microsoft 365/Outlook**: `https://login.microsoftonline.com/common/oauth2/v2.0/token`
+
+**Obtaining OAuth2 credentials (Gmail example)**:
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Create a project and enable the Gmail API
+3. Create OAuth 2.0 credentials (Desktop app type)
+4. Use a tool like `oauth2helper` or Google's OAuth Playground to obtain a refresh token
+5. Enter the client ID, client secret, and refresh token in E2NB
 
 ### General Settings
 
@@ -314,6 +356,7 @@ Detect changes on web pages by periodically fetching them and comparing content 
 enabled = False
 pages = [{"name": "Product Page", "url": "https://example.com/product", "selector": ".price"}]
 check_interval = 300
+notify_on_first_check = False
 ```
 
 | Setting | Description | Default |
@@ -321,22 +364,54 @@ check_interval = 300
 | `enabled` | Enable web page monitoring | `False` |
 | `pages` | JSON array of page objects (see below) | `[]` |
 | `check_interval` | Seconds between page checks | `300` |
+| `notify_on_first_check` | Send notification on the first check (before any change is detected) | `False` |
 
-**Page object format**:
+**Page object format (JSON array)**:
 
 ```json
 [
   {
     "name": "Product Page",
     "url": "https://example.com/product",
-    "selector": ".price"
+    "selector": ".price",
+    "timeout": 30,
+    "headers": {"User-Agent": "Mozilla/5.0"},
+    "notify_on_error": true
   }
 ]
 ```
 
-- `name` (required): Display name for notifications
-- `url` (required): Page URL to monitor
-- `selector` (optional): CSS selector to monitor only a specific part of the page (e.g., `.price`, `#stock-status`, `div.content`). If omitted, the entire page body is monitored.
+| Field | Description | Default |
+|-------|-------------|---------|
+| `name` | Display name for notifications | *(required)* |
+| `url` | Page URL to monitor | *(required)* |
+| `selector` | CSS selector to monitor specific element (e.g., `.price`, `#stock`) | *(empty - full page)* |
+| `timeout` | Request timeout in seconds | `30` |
+| `headers` | Custom HTTP headers as JSON object | `{}` |
+| `notify_on_error` | Send notification when page fetch fails | `True` |
+
+**Alternative configuration (individual sections)**:
+
+Instead of a JSON array, you can define each page as a separate INI section:
+
+```ini
+[WebMonitor]
+enabled = True
+check_interval = 300
+
+[WebMonitor.product_price]
+url = https://store.example.com/widget
+selector = .price-current
+timeout = 30
+headers = {"User-Agent": "Mozilla/5.0 (compatible; E2NB Monitor)"}
+notify_on_error = True
+
+[WebMonitor.status_page]
+url = https://status.example.com
+selector = #current-status
+```
+
+This format is easier to manage for multiple pages and avoids JSON escaping issues.
 
 When a change is detected, E2NB sends a notification with the page name and the new content (or a change summary).
 
@@ -344,13 +419,15 @@ When a change is detected, E2NB sends a notification with the page name and the 
 
 ### HTTP Endpoint Monitoring
 
-Monitor HTTP/HTTPS endpoints for availability and correct status codes.
+Monitor HTTP/HTTPS endpoints for availability, status codes, and response content.
 
 ```ini
 [HttpMonitor]
 enabled = False
 endpoints = [{"name": "API Health", "url": "https://api.example.com/health", "method": "GET", "expected_status": 200}]
 check_interval = 60
+notify_on_first_check = False
+default_failure_threshold = 1
 ```
 
 | Setting | Description | Default |
@@ -358,8 +435,10 @@ check_interval = 60
 | `enabled` | Enable HTTP endpoint monitoring | `False` |
 | `endpoints` | JSON array of endpoint objects (see below) | `[]` |
 | `check_interval` | Seconds between endpoint checks | `60` |
+| `notify_on_first_check` | Send notification on the first check | `False` |
+| `default_failure_threshold` | Default number of consecutive failures before alerting | `1` |
 
-**Endpoint object format**:
+**Endpoint object format (JSON array)**:
 
 ```json
 [
@@ -367,20 +446,67 @@ check_interval = 60
     "name": "API Health",
     "url": "https://api.example.com/health",
     "method": "GET",
-    "expected_status": 200
+    "expected_status": 200,
+    "expected_text": "ok",
+    "expected_text_regex": "^(ok|healthy)$",
+    "timeout": 30,
+    "headers": {"Authorization": "Bearer token"},
+    "body": {"key": "value"},
+    "basic_auth_user": "username",
+    "basic_auth_pass": "password",
+    "failure_threshold": 3,
+    "verify_ssl": true
   }
 ]
 ```
 
-- `name` (required): Display name for notifications
-- `url` (required): Endpoint URL
-- `method` (optional): HTTP method (`GET`, `POST`, `HEAD`, etc.). Default: `GET`
-- `expected_status` (optional): Expected HTTP status code. Default: `200`
+| Field | Description | Default |
+|-------|-------------|---------|
+| `name` | Display name for notifications | *(required)* |
+| `url` | Endpoint URL | *(required)* |
+| `method` | HTTP method (`GET`, `POST`, `HEAD`, `PUT`, `DELETE`) | `GET` |
+| `expected_status` | Expected HTTP status code | `200` |
+| `expected_text` | Exact text that must appear in response body | *(empty)* |
+| `expected_text_regex` | Regex pattern that response body must match | *(empty)* |
+| `timeout` | Request timeout in seconds | `30` |
+| `headers` | Custom HTTP headers as JSON object | `{}` |
+| `body` | Request body for POST/PUT requests (JSON object or string) | *(empty)* |
+| `basic_auth_user` | HTTP Basic Authentication username | *(empty)* |
+| `basic_auth_pass` | HTTP Basic Authentication password | *(empty)* |
+| `failure_threshold` | Consecutive failures before alerting | `1` |
+| `verify_ssl` | Verify SSL/TLS certificates | `True` |
+
+**Alternative configuration (individual sections)**:
+
+Instead of a JSON array, you can define each endpoint as a separate INI section:
+
+```ini
+[HttpMonitor]
+enabled = True
+check_interval = 60
+
+[HttpMonitor.api_health]
+url = https://api.example.com/health
+method = GET
+expected_status = 200
+expected_text = ok
+timeout = 30
+failure_threshold = 3
+
+[HttpMonitor.auth_service]
+url = https://auth.example.com/ping
+method = GET
+expected_status = 204
+basic_auth_user = monitor
+basic_auth_pass = secret123
+headers = {"X-Custom-Header": "value"}
+```
 
 **Notification triggers**:
-- **Endpoint DOWN**: Sent when an endpoint returns an unexpected status code or fails to respond
+- **Endpoint DOWN**: Sent when an endpoint returns an unexpected status code, fails text matching, or fails to respond
 - **Endpoint RECOVERED**: Sent when a previously-down endpoint starts responding correctly again
 - Response time is measured and included in notifications
+- `failure_threshold` allows ignoring transient failures (e.g., set to 3 to alert only after 3 consecutive failures)
 
 ---
 
@@ -465,26 +591,42 @@ to_number = whatsapp:+15559876543
 
 ### Slack
 
-Post notifications to a Slack channel via Bot Token.
+Post notifications to Slack channels and/or send direct messages via Bot Token. Supports Block Kit formatting and @mentions.
 
 ```ini
 [Slack]
 enabled = True
 token = xoxb-xxxxxxxxxxxx-xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxx
 channel = #notifications
+mention_users = U01XXXXXXXX, U02YYYYYYYY
+dm_users = U03ZZZZZZZZ
+use_blocks = True
 ```
 
-| Setting | Description |
-|---------|-------------|
-| `token` | Slack Bot Token (starts with `xoxb-`) |
-| `channel` | Channel name (e.g., `#notifications`) or channel ID (e.g., `C01XXXXXXXX`) |
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `token` | Slack Bot Token (starts with `xoxb-`) | *(required)* |
+| `channel` | Channel name (e.g., `#notifications`) or channel ID (e.g., `C01XXXXXXXX`) | *(empty)* |
+| `mention_users` | Comma-separated user IDs to @mention in channel messages | *(empty)* |
+| `dm_users` | Comma-separated user IDs to send direct messages to | *(empty)* |
+| `use_blocks` | Use Slack Block Kit for rich formatting (header + body sections) | `True` |
+
+**Features**:
+- **Channel Messages**: Post to public or private channels (bot must be invited)
+- **Direct Messages**: Send DMs to individual users via `dm_users`
+- **@Mentions**: Tag users in channel posts to notify them
+- **Block Kit**: Rich message formatting with headers and sections (disable for plain text)
 
 **Setup steps**:
 1. Go to https://api.slack.com/apps and create a new app
-2. Under **OAuth & Permissions**, add the `chat:write` bot scope
+2. Under **OAuth & Permissions**, add the following bot scopes:
+   - `chat:write` - Post messages to channels
+   - `im:write` - Send direct messages (if using DMs)
+   - `users:read` - Look up user information (optional)
 3. Install the app to your workspace
 4. Copy the **Bot User OAuth Token** (starts with `xoxb-`)
-5. Invite the bot to your target channel: `/invite @YourBotName`
+5. Invite the bot to target channels: `/invite @YourBotName`
+6. To find user IDs: click on a user's profile > "More" > "Copy member ID"
 
 ### Telegram
 
@@ -530,6 +672,101 @@ webhook_url = https://discord.com/api/webhooks/xxxxxxxxxxxx/xxxxxxxxxxxx
 3. Click **New Webhook**, configure it, and copy the webhook URL
 
 Messages are truncated to 2000 characters (Discord API limit).
+
+### Microsoft Teams
+
+Post notifications to Microsoft Teams channels via incoming webhook with optional Adaptive Card formatting.
+
+```ini
+[Teams]
+enabled = True
+webhook_url = https://outlook.webhook.office.com/webhookb2/xxxxx/IncomingWebhook/xxxxx/xxxxx
+use_adaptive_card = True
+```
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `webhook_url` | Teams incoming webhook URL | *(required)* |
+| `use_adaptive_card` | Use Adaptive Card format for rich cards with headers | `True` |
+
+**Formatting modes**:
+- **Adaptive Card** (default): Rich card with colored header and structured body
+- **Plain text**: Simple message format (set `use_adaptive_card = False`)
+
+**Setup steps**:
+1. In Microsoft Teams, go to the target channel
+2. Click the `...` menu > **Connectors** (or **Workflows** in newer Teams)
+3. Search for **Incoming Webhook** and click **Configure**
+4. Give the webhook a name and optional icon
+5. Copy the webhook URL
+
+### Pushover
+
+Send push notifications via the Pushover service with priority levels and sound customization.
+
+```ini
+[Pushover]
+enabled = True
+api_token = axxxxxxxxxxxxxxxxxxxxxxxxxx
+user_key = uxxxxxxxxxxxxxxxxxxxxxxxxxx
+priority = 0
+sound = pushover
+device =
+```
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `api_token` | Pushover application API token | *(required)* |
+| `user_key` | Pushover user or group key | *(required)* |
+| `priority` | Notification priority: -2 (lowest), -1 (low), 0 (normal), 1 (high), 2 (emergency) | `0` |
+| `sound` | Notification sound name (see Pushover docs for options) | *(empty - uses default)* |
+| `device` | Specific device name to send to (leave empty for all devices) | *(empty)* |
+
+**Priority levels**:
+- **-2**: Lowest priority, no notification
+- **-1**: Low priority, no sound/vibration
+- **0**: Normal priority
+- **1**: High priority, bypasses quiet hours
+- **2**: Emergency priority, repeats until acknowledged (requires additional parameters)
+
+**Setup steps**:
+1. Create an account at https://pushover.net
+2. Install the Pushover app on your device
+3. Copy your **User Key** from the Pushover dashboard
+4. Create an application to get an **API Token**
+
+### Ntfy
+
+Send notifications via ntfy.sh (self-hosted or public) - a simple HTTP-based pub-sub service.
+
+```ini
+[Ntfy]
+enabled = True
+server_url = https://ntfy.sh
+topic = my-alerts
+priority = default
+tags = warning,skull
+auth_token =
+```
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `server_url` | ntfy server URL (public or self-hosted) | `https://ntfy.sh` |
+| `topic` | Topic name to publish to | *(required)* |
+| `priority` | Priority: min, low, default, high, urgent | `default` |
+| `tags` | Comma-separated emoji tags (e.g., `warning,skull`) | *(empty)* |
+| `auth_token` | Bearer token for authenticated topics | *(empty)* |
+
+**Features**:
+- Works with the public ntfy.sh server or self-hosted instances
+- Simple topic-based subscription model
+- Supports emoji tags for visual categorization
+- Optional authentication for private topics
+
+**Setup steps**:
+1. Choose a unique topic name (e.g., `my-company-alerts-2024`)
+2. Subscribe to the topic using the ntfy app or web interface
+3. Optionally set up authentication if using private topics
 
 ### SMTP Email Forwarding
 
@@ -589,6 +826,77 @@ The webhook includes automatic retry with exponential backoff for transient fail
 
 ---
 
+## Notification Routing Rules
+
+E2NB supports conditional routing rules that let you control which notifications go to which channels based on content patterns, source types, and severity levels.
+
+```ini
+[NotificationRules]
+enabled = True
+rules = [
+  {
+    "name": "Critical Alerts",
+    "enabled": true,
+    "source_type": "email",
+    "sender_pattern": "alerts@",
+    "subject_pattern": "CRITICAL|URGENT",
+    "body_pattern": "",
+    "severity": "critical",
+    "channels": "sms,voice",
+    "suppress": false,
+    "priority_override": "2"
+  },
+  {
+    "name": "Suppress Marketing",
+    "enabled": true,
+    "source_type": "",
+    "sender_pattern": "marketing@|newsletter@",
+    "subject_pattern": "",
+    "body_pattern": "",
+    "severity": "",
+    "channels": "",
+    "suppress": true,
+    "priority_override": ""
+  }
+]
+```
+
+| Setting | Description |
+|---------|-------------|
+| `enabled` | Master enable/disable for notification routing rules |
+| `rules` | JSON array of rule objects (see below) |
+
+**Rule object format**:
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `name` | Display name for the rule | *(required)* |
+| `enabled` | Enable/disable this specific rule | `true` |
+| `source_type` | Match source type: `email`, `rss`, `web`, `http`, or empty for any | *(empty)* |
+| `sender_pattern` | Regex pattern to match against sender | *(empty)* |
+| `subject_pattern` | Regex pattern to match against subject/title | *(empty)* |
+| `body_pattern` | Regex pattern to match against body content | *(empty)* |
+| `severity` | Assign severity: `info`, `warning`, `error`, `critical` | *(empty)* |
+| `channels` | Comma-separated channels to send to (e.g., `sms,slack,telegram`) | *(empty)* |
+| `suppress` | If true, matching notifications are silently dropped | `false` |
+| `priority_override` | Override Pushover priority for matching notifications | *(empty)* |
+
+**How rules work**:
+1. Rules are evaluated in order for each notification
+2. All non-empty pattern fields must match for a rule to apply
+3. If `suppress` is true, the notification is dropped entirely
+4. If `channels` is specified, only those channels receive the notification
+5. Multiple rules can match; the last matching rule's settings take precedence
+6. If no rules match, all enabled channels receive the notification (default behavior)
+
+**Example use cases**:
+- Route critical alerts to SMS and voice calls
+- Send RSS updates only to Slack
+- Suppress newsletters and marketing emails
+- Override Pushover priority for security alerts
+
+---
+
 ## GUI Version
 
 ```bash
@@ -600,9 +908,9 @@ python e2nb.py
 The GUI uses a modern dark-sidebar design with four sections:
 
 **Sidebar Sections**:
-- **Sources** (with active count badge): Email, RSS Feeds, Web Pages, HTTP Endpoints - each with a green/gray status dot
-- **Notifications** (with active count badge): SMS, Voice, WhatsApp, Slack, Telegram, Discord, Webhook, Email (SMTP) - each with a status dot
-- **Configuration**: General settings (check interval, SMS length)
+- **Sources** (with active count badge): Email, SMTP Receiver, RSS Feeds, Web Pages, HTTP Endpoints - each with a green/gray status dot
+- **Notifications** (with active count badge): SMS, Voice, WhatsApp, Slack, Telegram, Discord, Teams, Pushover, Ntfy, Webhook, Email (SMTP) - each with a status dot
+- **Configuration**: General settings, Notification Rules
 - **Monitor**: Activity Logs with real-time color-coded output
 
 **Header Controls**:
@@ -1052,18 +1360,22 @@ state.save()
 
 ```python
 from e2nb_core import (
-    EmailConfig,         # IMAP/POP3 email connection settings
-    TwilioConfig,        # SMS, Voice, WhatsApp credentials
-    SlackConfig,         # Slack bot token and channel
-    TelegramConfig,      # Telegram bot token and chat ID
-    DiscordConfig,       # Discord webhook URL
-    WebhookConfig,       # Custom webhook URL
-    SmtpConfig,          # SMTP email forwarding settings
-    SmtpReceiverConfig,  # Local SMTP receiver settings
-    RssFeedConfig,       # RSS monitoring configuration
-    WebMonitorConfig,    # Web page monitoring configuration
-    HttpEndpointConfig,  # HTTP endpoint monitoring configuration
-    AppSettings,         # General application settings
+    EmailConfig,              # IMAP/POP3 email connection settings (incl. OAuth2)
+    TwilioConfig,             # SMS, Voice, WhatsApp credentials
+    SlackConfig,              # Slack bot token, channel, DMs, mentions
+    TelegramConfig,           # Telegram bot token and chat ID
+    DiscordConfig,            # Discord webhook URL
+    TeamsConfig,              # Microsoft Teams webhook with Adaptive Cards
+    PushoverConfig,           # Pushover API token, priority, sound, device
+    NtfyConfig,               # Ntfy server, topic, priority, tags
+    WebhookConfig,            # Custom webhook URL
+    SmtpConfig,               # SMTP email forwarding settings
+    SmtpReceiverConfig,       # Local SMTP receiver settings
+    RssFeedConfig,            # RSS monitoring configuration
+    WebMonitorConfig,         # Web page monitoring configuration
+    HttpEndpointConfig,       # HTTP endpoint monitoring configuration
+    NotificationRulesConfig,  # Conditional routing rules
+    AppSettings,              # General application settings
 )
 ```
 
@@ -1145,9 +1457,12 @@ sanitize_twiml('<script>alert("x")</script>')  # 'scriptalert("x")/script'
 | Service | Common Issues |
 |---------|---------------|
 | **Twilio SMS/Voice/WhatsApp** | Invalid credentials; unverified phone number (trial accounts); insufficient balance; wrong number format (must be E.164) |
-| **Slack** | Invalid token; bot not invited to channel; missing `chat:write` permission |
+| **Slack** | Invalid token; bot not invited to channel; missing `chat:write` permission; for DMs, missing `im:write` permission |
 | **Telegram** | Invalid bot token; user hasn't started the bot (send `/start` to the bot first); invalid chat ID |
 | **Discord** | Invalid or deleted webhook URL; URL must start with `https://discord.com/api/webhooks/` |
+| **Teams** | Invalid or expired webhook URL; connector not properly configured; Adaptive Card schema errors |
+| **Pushover** | Invalid API token or user key; exceeded message limits; emergency priority requires additional params |
+| **Ntfy** | Invalid topic name; authentication required for private topics; server URL misconfigured |
 | **SMTP** | Wrong server/port; TLS mismatch (port 587 needs STARTTLS, port 465 needs implicit SSL); blocked port by ISP |
 | **Webhook** | Endpoint not responding; wrong HTTP method; firewall blocking outbound requests |
 
