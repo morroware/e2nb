@@ -239,10 +239,13 @@ class TwilioConfig:
 
 @dataclass
 class SlackConfig:
-    """Slack notification configuration."""
+    """Slack notification configuration with enhanced features."""
     enabled: bool = False
     token: str = ""
     channel: str = ""
+    mention_users: str = ""  # Comma-separated Slack user IDs to @mention
+    dm_users: str = ""  # Comma-separated Slack user IDs to DM directly
+    use_blocks: bool = True  # Use Block Kit for rich formatting
 
     @classmethod
     def from_config(cls, config: configparser.ConfigParser) -> 'SlackConfig':
@@ -253,7 +256,10 @@ class SlackConfig:
         return cls(
             enabled=section.getboolean('enabled', fallback=False),
             token=section.get('token', ''),
-            channel=section.get('channel', '')
+            channel=section.get('channel', ''),
+            mention_users=section.get('mention_users', ''),
+            dm_users=section.get('dm_users', ''),
+            use_blocks=section.getboolean('use_blocks', fallback=True),
         )
 
 
@@ -375,6 +381,221 @@ class SmtpReceiverConfig:
             password=section.get('password', ''),
             filter_emails=filters
         )
+
+
+@dataclass
+class TeamsConfig:
+    """Microsoft Teams notification configuration via Incoming Webhook."""
+    enabled: bool = False
+    webhook_url: str = ""
+    use_adaptive_card: bool = True  # Use Adaptive Card for rich formatting
+
+    @classmethod
+    def from_config(cls, config: configparser.ConfigParser) -> 'TeamsConfig':
+        """Create TeamsConfig from ConfigParser."""
+        if 'Teams' not in config:
+            return cls()
+        section = config['Teams']
+        return cls(
+            enabled=section.getboolean('enabled', fallback=False),
+            webhook_url=section.get('webhook_url', ''),
+            use_adaptive_card=section.getboolean('use_adaptive_card', fallback=True),
+        )
+
+
+@dataclass
+class PushoverConfig:
+    """Pushover push notification configuration."""
+    enabled: bool = False
+    api_token: str = ""  # Application API token
+    user_key: str = ""  # User or group key
+    priority: int = 0  # -2 lowest, -1 low, 0 normal, 1 high, 2 emergency
+    sound: str = ""  # Notification sound name (empty = default)
+    device: str = ""  # Specific device name (empty = all devices)
+
+    @classmethod
+    def from_config(cls, config: configparser.ConfigParser) -> 'PushoverConfig':
+        """Create PushoverConfig from ConfigParser."""
+        if 'Pushover' not in config:
+            return cls()
+        section = config['Pushover']
+        return cls(
+            enabled=section.getboolean('enabled', fallback=False),
+            api_token=section.get('api_token', ''),
+            user_key=section.get('user_key', ''),
+            priority=safe_int(section.get('priority'), 0, min_val=-2, max_val=2),
+            sound=section.get('sound', ''),
+            device=section.get('device', ''),
+        )
+
+
+@dataclass
+class NtfyConfig:
+    """Ntfy.sh push notification configuration."""
+    enabled: bool = False
+    server_url: str = "https://ntfy.sh"  # Server URL (self-hosted or ntfy.sh)
+    topic: str = ""  # Topic name
+    priority: str = "default"  # min, low, default, high, urgent
+    tags: str = ""  # Comma-separated emoji tags (e.g., "warning,skull")
+    auth_token: str = ""  # Optional access token for authentication
+
+    @classmethod
+    def from_config(cls, config: configparser.ConfigParser) -> 'NtfyConfig':
+        """Create NtfyConfig from ConfigParser."""
+        if 'Ntfy' not in config:
+            return cls()
+        section = config['Ntfy']
+        return cls(
+            enabled=section.getboolean('enabled', fallback=False),
+            server_url=section.get('server_url', 'https://ntfy.sh'),
+            topic=section.get('topic', ''),
+            priority=section.get('priority', 'default'),
+            tags=section.get('tags', ''),
+            auth_token=section.get('auth_token', ''),
+        )
+
+
+@dataclass
+class NotificationRule:
+    """A single notification routing rule with conditions."""
+    name: str = ""
+    enabled: bool = True
+    # Conditions (all must match if specified)
+    source_type: str = ""  # 'email', 'rss', 'web', 'http', '' = any
+    sender_pattern: str = ""  # Regex pattern to match sender/source
+    subject_pattern: str = ""  # Regex pattern to match subject/title
+    body_pattern: str = ""  # Regex pattern to match body content
+    severity: str = ""  # 'info', 'warning', 'error', 'critical', '' = any
+    # Actions
+    channels: str = ""  # Comma-separated channel names to route to (empty = all enabled)
+    suppress: bool = False  # If True, suppress notification on matching channels
+    priority_override: str = ""  # Override priority for channels that support it
+
+    def matches(self, notification: 'EmailNotification', source_type: str = "email",
+                severity: str = "info") -> bool:
+        """Check if a notification matches this rule's conditions."""
+        if not self.enabled:
+            return False
+
+        if self.source_type and self.source_type.lower() != source_type.lower():
+            return False
+
+        if self.severity and self.severity.lower() != severity.lower():
+            return False
+
+        if self.sender_pattern:
+            try:
+                if not re.search(self.sender_pattern, notification.sender, re.IGNORECASE):
+                    return False
+            except re.error:
+                return False
+
+        if self.subject_pattern:
+            try:
+                if not re.search(self.subject_pattern, notification.subject, re.IGNORECASE):
+                    return False
+            except re.error:
+                return False
+
+        if self.body_pattern:
+            try:
+                if not re.search(self.body_pattern, notification.body, re.IGNORECASE):
+                    return False
+            except re.error:
+                return False
+
+        return True
+
+
+@dataclass
+class NotificationRulesConfig:
+    """Configuration for conditional notification routing rules."""
+    enabled: bool = False
+    rules: List[NotificationRule] = field(default_factory=list)
+
+    @classmethod
+    def from_config(cls, config: configparser.ConfigParser) -> 'NotificationRulesConfig':
+        """Create NotificationRulesConfig from ConfigParser."""
+        if 'NotificationRules' not in config:
+            return cls()
+        section = config['NotificationRules']
+        enabled = section.getboolean('enabled', fallback=False)
+
+        # Parse rules from JSON string
+        rules_str = section.get('rules', '[]')
+        rules = []
+        try:
+            parsed = json.loads(rules_str)
+            if isinstance(parsed, list):
+                for rule_dict in parsed:
+                    if isinstance(rule_dict, dict):
+                        rules.append(NotificationRule(
+                            name=rule_dict.get('name', ''),
+                            enabled=rule_dict.get('enabled', True),
+                            source_type=rule_dict.get('source_type', ''),
+                            sender_pattern=rule_dict.get('sender_pattern', ''),
+                            subject_pattern=rule_dict.get('subject_pattern', ''),
+                            body_pattern=rule_dict.get('body_pattern', ''),
+                            severity=rule_dict.get('severity', ''),
+                            channels=rule_dict.get('channels', ''),
+                            suppress=rule_dict.get('suppress', False),
+                            priority_override=rule_dict.get('priority_override', ''),
+                        ))
+        except json.JSONDecodeError as e:
+            if rules_str.strip() not in ('[]', ''):
+                logger.error(f"Failed to parse notification rules JSON: {e}")
+
+        return cls(enabled=enabled, rules=rules)
+
+    def get_matching_rules(self, notification: 'EmailNotification',
+                           source_type: str = "email",
+                           severity: str = "info") -> List[NotificationRule]:
+        """Get all rules that match a notification."""
+        if not self.enabled:
+            return []
+        return [r for r in self.rules if r.matches(notification, source_type, severity)]
+
+    def get_channel_decisions(self, notification: 'EmailNotification',
+                              all_channels: List[str],
+                              source_type: str = "email",
+                              severity: str = "info") -> Dict[str, bool]:
+        """
+        Determine which channels should receive a notification based on rules.
+
+        Returns a dict of {channel_name: should_send}.
+        If no rules match, all channels are enabled (default behavior).
+        """
+        matching_rules = self.get_matching_rules(notification, source_type, severity)
+
+        if not matching_rules:
+            # No rules match - send to all enabled channels (default)
+            return {ch: True for ch in all_channels}
+
+        # Start with all channels enabled
+        decisions = {ch: True for ch in all_channels}
+
+        for rule in matching_rules:
+            if rule.suppress:
+                # Suppress specific channels
+                if rule.channels:
+                    targets = [c.strip().lower() for c in rule.channels.split(',') if c.strip()]
+                    for ch in targets:
+                        if ch in decisions:
+                            decisions[ch] = False
+                else:
+                    # Suppress all channels
+                    for ch in decisions:
+                        decisions[ch] = False
+            elif rule.channels:
+                # Route only to specific channels - first disable all, then enable targets
+                for ch in decisions:
+                    decisions[ch] = False
+                targets = [c.strip().lower() for c in rule.channels.split(',') if c.strip()]
+                for ch in targets:
+                    if ch in decisions:
+                        decisions[ch] = True
+
+        return decisions
 
 
 # =============================================================================
@@ -982,7 +1203,10 @@ def create_default_config(config_file: str = CONFIG_FILE_PATH) -> None:
     config['Slack'] = {
         'enabled': 'False',
         'token': '',
-        'channel': ''
+        'channel': '',
+        'mention_users': '',
+        'dm_users': '',
+        'use_blocks': 'True'
     }
 
     config['Telegram'] = {
@@ -994,6 +1218,30 @@ def create_default_config(config_file: str = CONFIG_FILE_PATH) -> None:
     config['Discord'] = {
         'enabled': 'False',
         'webhook_url': ''
+    }
+
+    config['Teams'] = {
+        'enabled': 'False',
+        'webhook_url': '',
+        'use_adaptive_card': 'True'
+    }
+
+    config['Pushover'] = {
+        'enabled': 'False',
+        'api_token': '',
+        'user_key': '',
+        'priority': '0',
+        'sound': '',
+        'device': ''
+    }
+
+    config['Ntfy'] = {
+        'enabled': 'False',
+        'server_url': 'https://ntfy.sh',
+        'topic': '',
+        'priority': 'default',
+        'tags': '',
+        'auth_token': ''
     }
 
     config['CustomWebhook'] = {
@@ -1063,6 +1311,29 @@ def create_default_config(config_file: str = CONFIG_FILE_PATH) -> None:
     # expected_text = "status":"ok"
     # timeout = 30
     # failure_threshold = 3
+
+    # Notification routing rules - conditionally route notifications
+    config['NotificationRules'] = {
+        'enabled': 'False',
+        'rules': '[]'
+    }
+    # Example rules JSON:
+    # [
+    #   {
+    #     "name": "Critical alerts to SMS",
+    #     "enabled": true,
+    #     "severity": "error",
+    #     "channels": "sms,voice,slack",
+    #     "suppress": false
+    #   },
+    #   {
+    #     "name": "Suppress RSS from Discord",
+    #     "enabled": true,
+    #     "source_type": "rss",
+    #     "channels": "discord",
+    #     "suppress": true
+    #   }
+    # ]
 
     with open(config_file, 'w') as file:
         config.write(file)
@@ -1874,20 +2145,87 @@ def send_whatsapp_message(
         return NotificationResult(False, "WhatsApp", str(e))
 
 
+def _resolve_slack_channel(channel: str) -> str:
+    """Normalize a Slack channel reference for the API."""
+    channel = channel.strip()
+    is_channel_id = (
+        len(channel) > 1 and
+        channel[0] in ('C', 'G', 'D', 'U', 'W') and
+        channel[1:].replace('_', '').isalnum()
+    )
+    if not is_channel_id and not channel.startswith('#'):
+        channel = f'#{channel}'
+    return channel
+
+
+def _build_slack_blocks(subject: str, body: str, mention_users: str = "") -> list:
+    """Build Slack Block Kit blocks for rich notification formatting."""
+    mention_text = ""
+    if mention_users:
+        user_ids = [u.strip() for u in mention_users.split(',') if u.strip()]
+        if user_ids:
+            mention_text = " " + " ".join(f"<@{uid}>" for uid in user_ids)
+
+    blocks = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": subject[:150],
+                "emoji": True
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": body[:2900] + ("..." if len(body) > 2900 else "")
+            }
+        },
+    ]
+
+    if mention_text:
+        blocks.append({
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"Notifying:{mention_text}"
+                }
+            ]
+        })
+
+    blocks.append({
+        "type": "context",
+        "elements": [
+            {
+                "type": "mrkdwn",
+                "text": f"Sent via E2NB at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            }
+        ]
+    })
+
+    return blocks
+
+
 def send_slack_message(
     token: str,
     channel: str,
     subject: str,
-    body: str
+    body: str,
+    mention_users: str = "",
+    use_blocks: bool = True
 ) -> NotificationResult:
     """
-    Send a message to a Slack channel.
+    Send a message to a Slack channel with optional @mentions and Block Kit.
 
     Args:
         token: Slack API token.
-        channel: Slack channel name.
+        channel: Slack channel name or ID.
         subject: Message subject.
         body: Message body.
+        mention_users: Comma-separated Slack user IDs to @mention.
+        use_blocks: Use Block Kit for rich formatting.
 
     Returns:
         NotificationResult with success status and message timestamp.
@@ -1898,28 +2236,29 @@ def send_slack_message(
     if not token or not channel:
         return NotificationResult(False, "Slack", "Token or channel not configured")
 
-    # Handle channel format:
-    # - Channel IDs start with C (public), G (private/group), or D (DM) - use as-is
-    # - Channel names should have # prefix added
-    channel = channel.strip()
-    # Check if it looks like a channel ID (starts with C, G, or D and is alphanumeric)
-    is_channel_id = (
-        len(channel) > 1 and
-        channel[0] in ('C', 'G', 'D') and
-        channel[1:].replace('_', '').isalnum()
-    )
-    if not is_channel_id and not channel.startswith('#'):
-        channel = f'#{channel}'
+    channel = _resolve_slack_channel(channel)
 
     try:
         client = SlackWebClient(token=token)
-        formatted_body = f"*{subject}*\n{body}"
 
-        response = client.chat_postMessage(
-            channel=channel,
-            text=formatted_body,
-            parse='full'
-        )
+        # Build mention prefix for fallback text
+        mention_prefix = ""
+        if mention_users:
+            user_ids = [u.strip() for u in mention_users.split(',') if u.strip()]
+            if user_ids:
+                mention_prefix = " ".join(f"<@{uid}>" for uid in user_ids) + "\n"
+
+        fallback_text = f"{mention_prefix}*{subject}*\n{body}"
+
+        kwargs = {
+            'channel': channel,
+            'text': fallback_text,
+        }
+
+        if use_blocks:
+            kwargs['blocks'] = _build_slack_blocks(subject, body, mention_users)
+
+        response = client.chat_postMessage(**kwargs)
 
         timestamp = response.get("ts", "")
         logger.info(f"Sent Slack message with timestamp: {timestamp}")
@@ -1931,6 +2270,63 @@ def send_slack_message(
     except Exception as e:
         logger.error(f"Unexpected error sending Slack message: {e}")
         return NotificationResult(False, "Slack", str(e))
+
+
+def send_slack_dm(
+    token: str,
+    user_id: str,
+    subject: str,
+    body: str,
+    use_blocks: bool = True
+) -> NotificationResult:
+    """
+    Send a direct message to a Slack user.
+
+    Opens a DM conversation with the user and posts the notification.
+
+    Args:
+        token: Slack API token (needs chat:write, im:write scopes).
+        user_id: Slack user ID (e.g., U01ABCDEF).
+        subject: Message subject.
+        body: Message body.
+        use_blocks: Use Block Kit for rich formatting.
+
+    Returns:
+        NotificationResult with success status.
+    """
+    if not SLACK_AVAILABLE:
+        return NotificationResult(False, "Slack DM", "Slack SDK not installed")
+
+    if not token or not user_id:
+        return NotificationResult(False, "Slack DM", "Token or user ID not configured")
+
+    try:
+        client = SlackWebClient(token=token)
+
+        # Open DM conversation with the user
+        dm_response = client.conversations_open(users=[user_id.strip()])
+        dm_channel = dm_response['channel']['id']
+
+        fallback_text = f"*{subject}*\n{body}"
+        kwargs = {
+            'channel': dm_channel,
+            'text': fallback_text,
+        }
+
+        if use_blocks:
+            kwargs['blocks'] = _build_slack_blocks(subject, body)
+
+        response = client.chat_postMessage(**kwargs)
+        timestamp = response.get("ts", "")
+        logger.info(f"Sent Slack DM to {user_id} with timestamp: {timestamp}")
+        return NotificationResult(True, "Slack DM", f"DM sent to {user_id}", timestamp)
+    except SlackApiError as e:
+        error_msg = e.response.get('error', str(e)) if hasattr(e, 'response') else str(e)
+        logger.error(f"Failed to send Slack DM to {user_id}: {error_msg}")
+        return NotificationResult(False, "Slack DM", error_msg)
+    except Exception as e:
+        logger.error(f"Unexpected error sending Slack DM: {e}")
+        return NotificationResult(False, "Slack DM", str(e))
 
 
 def escape_telegram_markdown_v2(text: str) -> str:
@@ -2131,6 +2527,237 @@ def send_custom_webhook(
         return NotificationResult(False, "Webhook", str(e))
 
 
+def send_teams_message(
+    webhook_url: str,
+    subject: str,
+    body: str,
+    session: Optional[requests.Session] = None,
+    use_adaptive_card: bool = True
+) -> NotificationResult:
+    """
+    Send a message to Microsoft Teams via Incoming Webhook.
+
+    Args:
+        webhook_url: Teams Incoming Webhook URL.
+        subject: Message subject.
+        body: Message body.
+        session: Optional requests session for connection pooling.
+        use_adaptive_card: Use Adaptive Card format for rich rendering.
+
+    Returns:
+        NotificationResult with success status.
+    """
+    if not validate_url(webhook_url):
+        return NotificationResult(False, "Teams", "Invalid webhook URL")
+
+    try:
+        if use_adaptive_card:
+            # Adaptive Card format for rich rendering in Teams
+            payload = {
+                "type": "message",
+                "attachments": [
+                    {
+                        "contentType": "application/vnd.microsoft.card.adaptive",
+                        "contentUrl": None,
+                        "content": {
+                            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                            "type": "AdaptiveCard",
+                            "version": "1.4",
+                            "body": [
+                                {
+                                    "type": "TextBlock",
+                                    "text": subject,
+                                    "weight": "Bolder",
+                                    "size": "Medium",
+                                    "wrap": True
+                                },
+                                {
+                                    "type": "TextBlock",
+                                    "text": body[:4000] + ("..." if len(body) > 4000 else ""),
+                                    "wrap": True,
+                                    "spacing": "Medium"
+                                },
+                                {
+                                    "type": "TextBlock",
+                                    "text": f"Sent by E2NB at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                                    "size": "Small",
+                                    "isSubtle": True,
+                                    "spacing": "Medium"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        else:
+            # Simple text format
+            payload = {
+                "text": f"**{subject}**\n\n{body}"
+            }
+
+        http_session = session or create_http_session()
+        response = http_session.post(
+            webhook_url,
+            json=payload,
+            timeout=DEFAULT_TIMEOUT,
+            headers={"Content-Type": "application/json"}
+        )
+
+        if response.status_code in [200, 202]:
+            logger.info("Sent Teams message")
+            return NotificationResult(True, "Teams", "Message sent")
+        else:
+            error_msg = f"HTTP {response.status_code}: {response.text[:200]}"
+            logger.error(f"Failed to send Teams message: {error_msg}")
+            return NotificationResult(False, "Teams", error_msg)
+    except Exception as e:
+        logger.error(f"Failed to send Teams message: {e}")
+        return NotificationResult(False, "Teams", str(e))
+
+
+def send_pushover_notification(
+    api_token: str,
+    user_key: str,
+    subject: str,
+    body: str,
+    priority: int = 0,
+    sound: str = "",
+    device: str = "",
+    session: Optional[requests.Session] = None
+) -> NotificationResult:
+    """
+    Send a push notification via Pushover.
+
+    Args:
+        api_token: Pushover application API token.
+        user_key: Pushover user or group key.
+        subject: Notification title.
+        body: Notification message.
+        priority: Priority level (-2 to 2).
+        sound: Notification sound name.
+        device: Target device name (empty = all).
+        session: Optional requests session.
+
+    Returns:
+        NotificationResult with success status.
+    """
+    if not api_token or not user_key:
+        return NotificationResult(False, "Pushover", "API token or user key not configured")
+
+    try:
+        params = {
+            'token': api_token,
+            'user': user_key,
+            'title': subject[:250],
+            'message': body[:1024] + ("..." if len(body) > 1024 else ""),
+            'priority': max(-2, min(2, priority)),
+        }
+
+        if sound:
+            params['sound'] = sound
+        if device:
+            params['device'] = device
+
+        # Emergency priority requires retry and expire parameters
+        if priority == 2:
+            params['retry'] = 60  # Retry every 60 seconds
+            params['expire'] = 3600  # Expire after 1 hour
+
+        http_session = session or create_http_session()
+        response = http_session.post(
+            'https://api.pushover.net/1/messages.json',
+            data=params,
+            timeout=DEFAULT_TIMEOUT
+        )
+
+        if response.status_code == 200:
+            result_data = response.json()
+            if result_data.get('status') == 1:
+                logger.info("Sent Pushover notification")
+                return NotificationResult(True, "Pushover", "Notification sent",
+                                         result_data.get('request', ''))
+            else:
+                errors = result_data.get('errors', ['Unknown error'])
+                error_msg = "; ".join(errors)
+                logger.error(f"Pushover API error: {error_msg}")
+                return NotificationResult(False, "Pushover", error_msg)
+        else:
+            error_msg = f"HTTP {response.status_code}: {response.text[:200]}"
+            logger.error(f"Failed to send Pushover notification: {error_msg}")
+            return NotificationResult(False, "Pushover", error_msg)
+    except Exception as e:
+        logger.error(f"Failed to send Pushover notification: {e}")
+        return NotificationResult(False, "Pushover", str(e))
+
+
+def send_ntfy_notification(
+    server_url: str,
+    topic: str,
+    subject: str,
+    body: str,
+    priority: str = "default",
+    tags: str = "",
+    auth_token: str = "",
+    session: Optional[requests.Session] = None
+) -> NotificationResult:
+    """
+    Send a push notification via ntfy.sh (or self-hosted ntfy).
+
+    Args:
+        server_url: Ntfy server URL (e.g., https://ntfy.sh).
+        topic: Topic to publish to.
+        subject: Notification title.
+        body: Notification message.
+        priority: Priority (min, low, default, high, urgent).
+        tags: Comma-separated emoji tags.
+        auth_token: Optional bearer token for authentication.
+        session: Optional requests session.
+
+    Returns:
+        NotificationResult with success status.
+    """
+    if not topic:
+        return NotificationResult(False, "Ntfy", "Topic not configured")
+
+    # Normalize server URL
+    base_url = server_url.rstrip('/')
+    if not base_url:
+        base_url = "https://ntfy.sh"
+
+    publish_url = f"{base_url}/{topic}"
+
+    try:
+        headers = {
+            "Title": subject[:250],
+            "Priority": priority if priority in ('min', 'low', 'default', 'high', 'urgent') else 'default',
+        }
+
+        if tags:
+            headers["Tags"] = tags
+
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token}"
+
+        http_session = session or create_http_session()
+        response = http_session.post(
+            publish_url,
+            data=body[:4096].encode('utf-8'),
+            headers=headers,
+            timeout=DEFAULT_TIMEOUT
+        )
+
+        if response.status_code == 200:
+            logger.info(f"Sent ntfy notification to {topic}")
+            return NotificationResult(True, "Ntfy", f"Published to {topic}")
+        else:
+            error_msg = f"HTTP {response.status_code}: {response.text[:200]}"
+            logger.error(f"Failed to send ntfy notification: {error_msg}")
+            return NotificationResult(False, "Ntfy", error_msg)
+    except Exception as e:
+        logger.error(f"Failed to send ntfy notification: {e}")
+        return NotificationResult(False, "Ntfy", str(e))
+
+
 def send_email_notification(
     smtp_server: str,
     smtp_port: int,
@@ -2293,6 +2920,13 @@ class EmailNotification:
 class NotificationDispatcher:
     """Handles dispatching notifications to all configured channels."""
 
+    # Canonical channel names for routing rules
+    CHANNEL_NAMES = [
+        'sms', 'voice', 'whatsapp', 'slack', 'slack_dm',
+        'telegram', 'discord', 'teams', 'pushover', 'ntfy',
+        'webhook', 'email',
+    ]
+
     def __init__(self, config: configparser.ConfigParser):
         self.settings = AppSettings.from_config(config)
         self.twilio_sms = TwilioConfig.from_config(config, 'Twilio')
@@ -2301,8 +2935,12 @@ class NotificationDispatcher:
         self.slack = SlackConfig.from_config(config)
         self.telegram = TelegramConfig.from_config(config)
         self.discord = DiscordConfig.from_config(config)
+        self.teams = TeamsConfig.from_config(config)
+        self.pushover = PushoverConfig.from_config(config)
+        self.ntfy = NtfyConfig.from_config(config)
         self.webhook = WebhookConfig.from_config(config)
         self.smtp = SmtpConfig.from_config(config)
+        self.notification_rules = NotificationRulesConfig.from_config(config)
         self._http_session: Optional[requests.Session] = None
 
     @property
@@ -2334,29 +2972,77 @@ class NotificationDispatcher:
             self.slack.enabled,
             self.telegram.enabled,
             self.discord.enabled,
+            self.teams.enabled,
+            self.pushover.enabled,
+            self.ntfy.enabled,
             self.webhook.enabled,
             self.smtp.enabled
         ])
 
+    def _get_enabled_channels(self) -> List[str]:
+        """Get list of enabled channel names."""
+        channels = []
+        if self.twilio_sms.enabled:
+            channels.append('sms')
+        if self.twilio_voice.enabled:
+            channels.append('voice')
+        if self.twilio_whatsapp.enabled:
+            channels.append('whatsapp')
+        if self.slack.enabled:
+            channels.append('slack')
+        if self.slack.enabled and self.slack.dm_users:
+            channels.append('slack_dm')
+        if self.telegram.enabled:
+            channels.append('telegram')
+        if self.discord.enabled:
+            channels.append('discord')
+        if self.teams.enabled:
+            channels.append('teams')
+        if self.pushover.enabled:
+            channels.append('pushover')
+        if self.ntfy.enabled:
+            channels.append('ntfy')
+        if self.webhook.enabled:
+            channels.append('webhook')
+        if self.smtp.enabled:
+            channels.append('email')
+        return channels
+
     def dispatch(
         self,
         notification: EmailNotification,
-        callback: Optional[Callable[[NotificationResult], None]] = None
+        callback: Optional[Callable[[NotificationResult], None]] = None,
+        source_type: str = "email",
+        severity: str = "info"
     ) -> List[NotificationResult]:
         """
-        Send notification to all enabled channels.
+        Send notification to all enabled channels, respecting routing rules.
 
         Args:
             notification: Email notification to send.
             callback: Optional callback for each result.
+            source_type: Source type for rule matching.
+            severity: Severity level for rule matching.
 
         Returns:
             List of NotificationResult objects.
         """
         results = []
 
+        # Determine which channels should receive this notification
+        enabled_channels = self._get_enabled_channels()
+        if self.notification_rules.enabled:
+            channel_decisions = self.notification_rules.get_channel_decisions(
+                notification, enabled_channels, source_type, severity
+            )
+        else:
+            channel_decisions = {ch: True for ch in enabled_channels}
+
+        def _should_send(channel_name: str) -> bool:
+            return channel_decisions.get(channel_name, True)
+
         # SMS via Twilio
-        if self.twilio_sms.enabled:
+        if self.twilio_sms.enabled and _should_send('sms'):
             sms_body = notification.truncate_for_sms(self.settings.max_sms_length)
             for to_number in self.twilio_sms.destination_numbers:
                 result = send_sms_via_twilio(
@@ -2371,7 +3057,7 @@ class NotificationDispatcher:
                     callback(result)
 
         # Voice calls via Twilio
-        if self.twilio_voice.enabled:
+        if self.twilio_voice.enabled and _should_send('voice'):
             for to_number in self.twilio_voice.destination_numbers:
                 result = make_voice_call(
                     self.twilio_voice.account_sid,
@@ -2385,7 +3071,7 @@ class NotificationDispatcher:
                     callback(result)
 
         # WhatsApp via Twilio
-        if self.twilio_whatsapp.enabled:
+        if self.twilio_whatsapp.enabled and _should_send('whatsapp'):
             for to_number in self.twilio_whatsapp.destination_numbers:
                 result = send_whatsapp_message(
                     self.twilio_whatsapp.account_sid,
@@ -2398,20 +3084,37 @@ class NotificationDispatcher:
                 if callback:
                     callback(result)
 
-        # Slack
-        if self.slack.enabled:
+        # Slack channel message
+        if self.slack.enabled and _should_send('slack'):
             result = send_slack_message(
                 self.slack.token,
                 self.slack.channel,
                 notification.subject,
-                notification.body
+                notification.body,
+                mention_users=self.slack.mention_users,
+                use_blocks=self.slack.use_blocks,
             )
             results.append(result)
             if callback:
                 callback(result)
 
+        # Slack DMs to individual users
+        if self.slack.enabled and self.slack.dm_users and _should_send('slack_dm'):
+            dm_user_ids = [u.strip() for u in self.slack.dm_users.split(',') if u.strip()]
+            for user_id in dm_user_ids:
+                result = send_slack_dm(
+                    self.slack.token,
+                    user_id,
+                    notification.subject,
+                    notification.body,
+                    use_blocks=self.slack.use_blocks,
+                )
+                results.append(result)
+                if callback:
+                    callback(result)
+
         # Telegram
-        if self.telegram.enabled:
+        if self.telegram.enabled and _should_send('telegram'):
             result = send_telegram_message(
                 self.telegram.bot_token,
                 self.telegram.chat_id,
@@ -2424,7 +3127,7 @@ class NotificationDispatcher:
                 callback(result)
 
         # Discord
-        if self.discord.enabled:
+        if self.discord.enabled and _should_send('discord'):
             result = send_discord_message(
                 self.discord.webhook_url,
                 notification.subject,
@@ -2435,8 +3138,53 @@ class NotificationDispatcher:
             if callback:
                 callback(result)
 
+        # Microsoft Teams
+        if self.teams.enabled and _should_send('teams'):
+            result = send_teams_message(
+                self.teams.webhook_url,
+                notification.subject,
+                notification.body,
+                self.http_session,
+                use_adaptive_card=self.teams.use_adaptive_card,
+            )
+            results.append(result)
+            if callback:
+                callback(result)
+
+        # Pushover
+        if self.pushover.enabled and _should_send('pushover'):
+            result = send_pushover_notification(
+                self.pushover.api_token,
+                self.pushover.user_key,
+                notification.subject,
+                notification.body,
+                priority=self.pushover.priority,
+                sound=self.pushover.sound,
+                device=self.pushover.device,
+                session=self.http_session,
+            )
+            results.append(result)
+            if callback:
+                callback(result)
+
+        # Ntfy
+        if self.ntfy.enabled and _should_send('ntfy'):
+            result = send_ntfy_notification(
+                self.ntfy.server_url,
+                self.ntfy.topic,
+                notification.subject,
+                notification.body,
+                priority=self.ntfy.priority,
+                tags=self.ntfy.tags,
+                auth_token=self.ntfy.auth_token,
+                session=self.http_session,
+            )
+            results.append(result)
+            if callback:
+                callback(result)
+
         # Custom Webhook
-        if self.webhook.enabled:
+        if self.webhook.enabled and _should_send('webhook'):
             payload = {
                 'subject': notification.subject,
                 'body': notification.body,
@@ -2453,7 +3201,7 @@ class NotificationDispatcher:
                 callback(result)
 
         # SMTP Email
-        if self.smtp.enabled:
+        if self.smtp.enabled and _should_send('email'):
             for to_address in self.smtp.to_addresses:
                 result = send_email_notification(
                     self.smtp.smtp_server,

@@ -46,6 +46,10 @@ from e2nb_core import (
     EmailConfig,
     SmtpReceiverConfig,
     SmtpReceiver,
+    TeamsConfig,
+    PushoverConfig,
+    NtfyConfig,
+    NotificationRulesConfig,
     RssFeedConfig,
     WebMonitorConfig,
     HttpEndpointConfig,
@@ -282,15 +286,28 @@ class EmailMonitorDaemon:
         if self.config.getboolean('WhatsApp', 'enabled', fallback=False):
             enabled_methods.append('WhatsApp')
         if self.config.getboolean('Slack', 'enabled', fallback=False):
-            enabled_methods.append('Slack')
+            slack_label = 'Slack'
+            if self.config.get('Slack', 'dm_users', fallback=''):
+                slack_label += ' (+DMs)'
+            if self.config.get('Slack', 'mention_users', fallback=''):
+                slack_label += ' (+mentions)'
+            enabled_methods.append(slack_label)
         if self.config.getboolean('Telegram', 'enabled', fallback=False):
             enabled_methods.append('Telegram')
         if self.config.getboolean('Discord', 'enabled', fallback=False):
             enabled_methods.append('Discord')
+        if self.config.getboolean('Teams', 'enabled', fallback=False):
+            enabled_methods.append('Teams')
+        if self.config.getboolean('Pushover', 'enabled', fallback=False):
+            enabled_methods.append('Pushover')
+        if self.config.getboolean('Ntfy', 'enabled', fallback=False):
+            enabled_methods.append('Ntfy')
         if self.config.getboolean('CustomWebhook', 'enabled', fallback=False):
             enabled_methods.append('Webhook')
         if self.config.getboolean('SMTP', 'enabled', fallback=False):
             enabled_methods.append('Email (SMTP)')
+        if self.config.getboolean('NotificationRules', 'enabled', fallback=False):
+            enabled_methods.append('Routing Rules')
 
         logging.info(f"Enabled notification methods: {', '.join(enabled_methods)}")
 
@@ -1002,6 +1019,9 @@ def test_configuration(config_file: str) -> bool:
         ('Slack', 'Slack', 'enabled'),
         ('Telegram', 'Telegram', 'enabled'),
         ('Discord', 'Discord', 'enabled'),
+        ('Microsoft Teams', 'Teams', 'enabled'),
+        ('Pushover', 'Pushover', 'enabled'),
+        ('Ntfy', 'Ntfy', 'enabled'),
         ('Custom Webhook', 'CustomWebhook', 'enabled'),
         ('Email (SMTP)', 'SMTP', 'enabled'),
     ]
@@ -1018,6 +1038,16 @@ def test_configuration(config_file: str) -> bool:
         host = daemon.config.get('SmtpReceiver', 'host', fallback='0.0.0.0')
         port = daemon.config.get('SmtpReceiver', 'port', fallback='2525')
         print(f"  Listening on {host}:{port}")
+
+    # Notification rules
+    rules_enabled = daemon.config.getboolean('NotificationRules', 'enabled', fallback=False)
+    print(f"\nNotification Rules: {'ENABLED' if rules_enabled else 'disabled'}")
+    if rules_enabled:
+        rules_config = NotificationRulesConfig.from_config(daemon.config)
+        active_rules = [r for r in rules_config.rules if r.enabled]
+        print(f"  Active rules: {len(active_rules)}")
+        for rule in active_rules:
+            print(f"    - {rule.name}")
 
     # Show enabled monitoring sources
     print("\nEnabled monitoring sources:")
