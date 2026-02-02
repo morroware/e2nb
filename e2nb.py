@@ -2692,6 +2692,7 @@ class EmailMonitorApp:
         self._update_status_bar(f"Testing {proto} connection...")
 
         def test():
+            # Use all current UI settings to match what monitoring will use
             cfg = EmailConfig(
                 protocol=proto.lower(),
                 imap_server=self.imap_server.get(),
@@ -2699,7 +2700,11 @@ class EmailMonitorApp:
                 pop3_server=self.pop3_server.get(),
                 pop3_port=safe_int(self.pop3_port.get(), 995, min_val=1, max_val=65535),
                 username=self.username.get(),
-                password=self.password.get()
+                password=self.password.get(),
+                # Include TLS and connection settings to match monitoring behavior
+                tls_mode=self.tls_mode_var.get(),
+                verify_ssl=self.verify_ssl_var.get(),
+                connection_timeout=safe_int(self.conn_timeout.get(), DEFAULT_CONNECTION_TIMEOUT, min_val=5, max_val=300),
             )
             if proto == "POP3":
                 success, msg = test_pop3_connection(cfg)
@@ -2849,6 +2854,7 @@ class EmailMonitorApp:
                 verify_ssl = self.config.getboolean('Email', 'verify_ssl', fallback=True)
                 conn_timeout = safe_int(self.config.get('Email', 'connection_timeout', fallback=str(DEFAULT_CONNECTION_TIMEOUT)), DEFAULT_CONNECTION_TIMEOUT, min_val=5, max_val=300)
                 max_emails = safe_int(self.config.get('Email', 'max_emails_per_check', fallback='5'), 5, min_val=1, max_val=100)
+                ca_bundle = self.config.get('Email', 'ca_bundle', fallback='')
                 pop3 = None
 
                 if email_username and protocol == 'imap':
@@ -2860,6 +2866,7 @@ class EmailMonitorApp:
                         timeout=conn_timeout,
                         tls_mode=tls_mode,
                         verify_ssl=verify_ssl,
+                        ca_bundle=ca_bundle,
                     )
 
                     if imap:
@@ -2898,7 +2905,11 @@ class EmailMonitorApp:
                             if any(r.success for r in results):
                                 mark_as_read(imap, email_id)
                     else:
-                        self._log("IMAP connection failed", "WARNING")
+                        # Log connection details for debugging
+                        server = self.config.get('Email', 'imap_server')
+                        port = self.config.get('Email', 'imap_port', fallback='993')
+                        self._log(f"IMAP connection failed to {server}:{port} (TLS: {tls_mode})", "WARNING")
+                        self._log("Check email_monitor.log for details", "INFO")
 
                 elif email_username and protocol == 'pop3':
                     pop3 = connect_to_pop3(
@@ -2909,6 +2920,7 @@ class EmailMonitorApp:
                         timeout=conn_timeout,
                         tls_mode=tls_mode,
                         verify_ssl=verify_ssl,
+                        ca_bundle=ca_bundle,
                     )
 
                     if pop3:
@@ -2959,7 +2971,11 @@ class EmailMonitorApp:
                         # Cleanup old tracked messages periodically
                         monitor_state.cleanup_old_pop3_messages()
                     else:
-                        self._log("POP3 connection failed", "WARNING")
+                        # Log connection details for debugging
+                        server = self.config.get('Email', 'pop3_server')
+                        port = self.config.get('Email', 'pop3_port', fallback='995')
+                        self._log(f"POP3 connection failed to {server}:{port} (TLS: {tls_mode})", "WARNING")
+                        self._log("Check email_monitor.log for details", "INFO")
 
                 # =====================================================
                 # Check RSS Feeds
