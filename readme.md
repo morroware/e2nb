@@ -1,6 +1,6 @@
 # E2NB (Email to Notification Blaster)
 
-A Python application that monitors email inboxes via IMAP and forwards notifications through multiple channels: SMS, Voice, WhatsApp, Slack, Telegram, Discord, and custom webhooks.
+A Python application that monitors multiple sources (Email via IMAP/POP3, SMTP receiver, RSS feeds, web pages, HTTP endpoints) and forwards notifications through multiple channels: SMS, Voice, WhatsApp, Slack, Telegram, Discord, SMTP email, and custom webhooks.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
@@ -11,10 +11,9 @@ A Python application that monitors email inboxes via IMAP and forwards notificat
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Configuration](#configuration)
-- [Usage](#usage)
-- [GUI Version](#gui-version)
-- [Headless Version](#headless-version)
+- [Monitoring Sources](#monitoring-sources)
 - [Notification Channels](#notification-channels)
+- [Usage](#usage)
 - [API Reference](#api-reference)
 - [Troubleshooting](#troubleshooting)
 - [Contributing](#contributing)
@@ -22,11 +21,9 @@ A Python application that monitors email inboxes via IMAP and forwards notificat
 
 ## Architecture
 
-E2NB consists of three main components:
-
 ```
 e2nb/
-├── e2nb_core.py        # Shared core module (config, IMAP, notifications)
+├── e2nb_core.py        # Shared core module (config, email, notifications, monitoring)
 ├── e2nb.py             # GUI version (Tkinter)
 ├── e2nb-headless.py    # Headless daemon version
 ├── config.ini          # Configuration file
@@ -35,25 +32,33 @@ e2nb/
 
 **Core Module (`e2nb_core.py`)** contains:
 - Configuration management with data classes
-- IMAP connection and email operations
-- Notification service implementations
+- IMAP and POP3 email operations
+- SMTP receiver (local SMTP server for push-based email)
+- RSS feed monitoring
+- Web page change detection
+- HTTP endpoint monitoring
+- Notification service implementations (8 channels)
 - Input validation and sanitization
 - HTTP retry logic with exponential backoff
+- Atomic state file writes
 - Custom exception hierarchy
 
 ## Requirements
 
 - Python 3.8 or higher
-- IMAP-enabled email account
+- Email account with IMAP or POP3 access (or use the SMTP receiver)
 - API credentials for desired notification services
 
 ### Dependencies
 
 ```
-twilio>=8.0.0       # SMS, Voice, WhatsApp
-slack_sdk>=3.20.0   # Slack notifications
-requests>=2.28.0    # HTTP requests
-urllib3>=2.0.0      # Retry logic
+twilio>=8.0.0         # SMS, Voice, WhatsApp
+slack_sdk>=3.20.0     # Slack notifications
+requests>=2.28.0      # HTTP requests
+urllib3>=2.0.0        # Retry logic
+feedparser>=6.0.0     # RSS/Atom feed parsing
+beautifulsoup4>=4.12.0 # HTML parsing (web monitoring, RSS content)
+aiosmtpd>=1.4.0       # SMTP receiver
 ```
 
 GUI version additionally requires `tkinter` (included with most Python installations).
@@ -81,8 +86,11 @@ Configuration is stored in `config.ini`. The file is created automatically on fi
 
 ```ini
 [Email]
+protocol = imap
 imap_server = imap.gmail.com
 imap_port = 993
+pop3_server = pop.gmail.com
+pop3_port = 995
 username = your.email@gmail.com
 password = your-app-specific-password
 filter_emails = user@example.com, @trusted-domain.com
@@ -90,11 +98,14 @@ filter_emails = user@example.com, @trusted-domain.com
 
 | Setting | Description | Default |
 |---------|-------------|---------|
+| `protocol` | Email protocol: `imap` or `pop3` | imap |
 | `imap_server` | IMAP server hostname | imap.gmail.com |
 | `imap_port` | IMAP SSL port | 993 |
+| `pop3_server` | POP3 server hostname | pop.gmail.com |
+| `pop3_port` | POP3 SSL port | 995 |
 | `username` | Email address | (empty) |
 | `password` | Email password or app-specific password | (empty) |
-| `filter_emails` | Comma-separated list of allowed senders or domains (prefix domains with @) | (empty) |
+| `filter_emails` | Comma-separated allowed senders or domains (prefix domains with @) | (empty) |
 
 ### General Settings
 
@@ -109,103 +120,99 @@ check_interval = 60
 | `max_sms_length` | Maximum characters for SMS messages | 1600 |
 | `check_interval` | Seconds between email checks | 60 |
 
-## Usage
+## Monitoring Sources
 
-### GUI Version
+E2NB supports five monitoring sources. All sources are configured in the **Sources** section of the GUI sidebar.
 
-```bash
-python e2nb.py
-```
+### Email (IMAP)
 
-Features:
-- Tabbed interface for configuration
-- Real-time log display with color-coded severity levels
-- Status indicator showing monitoring state
-- Connection test functionality
-- Settings persistence to config.ini
+Traditional pull-based email monitoring. Connects to your mail server via IMAP SSL, checks for unread messages at the configured interval, and forwards them to your notification channels.
 
-Controls:
-- **Start Monitoring**: Begin email monitoring loop
-- **Stop Monitoring**: Gracefully stop monitoring
-- **Save Settings**: Write current configuration to config.ini
-- **Tools > Test Email Connection**: Verify IMAP credentials
-- **Tools > Clear Logs**: Clear the log display
+### Email (POP3)
 
-### Headless Version
+Alternative pull-based email monitoring via POP3 SSL. Useful for mail servers that don't support IMAP. Select POP3 in the protocol setting and configure your POP3 server details.
 
-```bash
-# Basic usage
-python e2nb-headless.py
+### SMTP Receiver
 
-# Custom configuration file
-python e2nb-headless.py -c /etc/e2nb/config.ini
-
-# Custom log file
-python e2nb-headless.py -l /var/log/e2nb.log
-
-# Verbose (debug) logging
-python e2nb-headless.py -v
-
-# Disable console output (log to file only)
-python e2nb-headless.py --no-console
-
-# Test configuration and exit
-python e2nb-headless.py --test
-
-# Show version
-python e2nb-headless.py --version
-```
-
-#### Command-Line Arguments
-
-| Argument | Description |
-|----------|-------------|
-| `-c, --config` | Path to configuration file (default: config.ini) |
-| `-l, --log-file` | Path to log file (default: email_monitor.log) |
-| `-v, --verbose` | Enable debug-level logging |
-| `--no-console` | Disable console output |
-| `--test` | Validate configuration and test IMAP connection |
-| `--version` | Display version and exit |
-
-#### Signal Handling
-
-| Signal | Action |
-|--------|--------|
-| `SIGINT` (Ctrl+C) | Graceful shutdown |
-| `SIGTERM` | Graceful shutdown |
-| `SIGHUP` | Reload configuration |
-
-#### Running as a Systemd Service
-
-Create `/etc/systemd/system/e2nb.service`:
+A local SMTP server that listens for incoming emails. Instead of polling a remote server, emails are pushed directly to E2NB. This is useful for receiving forwarded mail from other servers or services.
 
 ```ini
-[Unit]
-Description=E2NB Email Monitor
-After=network.target
-
-[Service]
-Type=simple
-User=e2nb
-WorkingDirectory=/opt/e2nb
-ExecStart=/usr/bin/python3 /opt/e2nb/e2nb-headless.py -c /etc/e2nb/config.ini -l /var/log/e2nb.log --no-console
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
+[SmtpReceiver]
+enabled = False
+host = 0.0.0.0
+port = 2525
+use_auth = False
+username =
+password =
+filter_emails =
 ```
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable e2nb
-sudo systemctl start e2nb
-sudo systemctl status e2nb
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `enabled` | Enable the local SMTP receiver | False |
+| `host` | Listen address | 0.0.0.0 |
+| `port` | Listen port | 2525 |
+| `use_auth` | Require SMTP authentication | False |
+| `username` | Auth username (if `use_auth` is True) | (empty) |
+| `password` | Auth password (if `use_auth` is True) | (empty) |
+| `filter_emails` | Comma-separated allowed senders or domains | (empty) |
 
-# Reload configuration without restart
-sudo systemctl reload e2nb
+Requires the `aiosmtpd` package.
+
+### RSS Feeds
+
+Monitor RSS/Atom feeds for new items. Each new feed entry triggers a notification.
+
+```ini
+[RSS]
+enabled = False
+feeds = []
+check_interval = 300
+max_age_hours = 24
+max_items_per_check = 10
 ```
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `enabled` | Enable RSS monitoring | False |
+| `feeds` | JSON array of feed URLs | [] |
+| `check_interval` | Seconds between feed checks | 300 |
+| `max_age_hours` | Ignore items older than this | 24 |
+| `max_items_per_check` | Max new items to process per check | 10 |
+
+### Web Page Monitor
+
+Detect changes on web pages. E2NB fetches pages periodically and notifies you when content changes.
+
+```ini
+[WebMonitor]
+enabled = False
+pages = []
+check_interval = 300
+```
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `enabled` | Enable web page monitoring | False |
+| `pages` | JSON array of page URLs to watch | [] |
+| `check_interval` | Seconds between checks | 300 |
+
+### HTTP Endpoint Monitor
+
+Monitor HTTP endpoints for availability. Sends a notification when an endpoint goes down or comes back up.
+
+```ini
+[HttpMonitor]
+enabled = False
+endpoints = []
+check_interval = 60
+```
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `enabled` | Enable HTTP endpoint monitoring | False |
+| `endpoints` | JSON array of endpoint URLs | [] |
+| `check_interval` | Seconds between checks | 60 |
 
 ## Notification Channels
 
@@ -270,7 +277,7 @@ bot_token = 1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
 chat_id = -1001234567890
 ```
 
-Create a bot via [@BotFather](https://t.me/botfather). Get chat ID via [@userinfobot](https://t.me/userinfobot).
+Messages are truncated to 4096 characters (Telegram API limit). Create a bot via [@BotFather](https://t.me/botfather).
 
 ### Discord
 
@@ -280,7 +287,36 @@ enabled = True
 webhook_url = https://discord.com/api/webhooks/xxxxxxxxxxxx/xxxxxxxxxxxx
 ```
 
-Create webhook in Channel Settings > Integrations > Webhooks.
+Messages are truncated to 2000 characters (Discord API limit). Create webhook in Channel Settings > Integrations > Webhooks.
+
+### SMTP (Email Forwarding)
+
+Forward notifications as emails via an SMTP server.
+
+```ini
+[SMTP]
+enabled = False
+smtp_server = smtp.gmail.com
+smtp_port = 587
+use_tls = True
+username =
+password =
+from_address =
+to_addresses =
+subject_prefix = [E2NB]
+```
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `enabled` | Enable SMTP email notifications | False |
+| `smtp_server` | Outbound SMTP server | smtp.gmail.com |
+| `smtp_port` | SMTP port | 587 |
+| `use_tls` | Use STARTTLS | True |
+| `username` | SMTP username | (empty) |
+| `password` | SMTP password | (empty) |
+| `from_address` | Sender address | (empty) |
+| `to_addresses` | Comma-separated recipient addresses | (empty) |
+| `subject_prefix` | Prefix added to email subjects | [E2NB] |
 
 ### Custom Webhook
 
@@ -301,6 +337,111 @@ Sends POST request with JSON payload:
 }
 ```
 
+## Usage
+
+### GUI Version
+
+```bash
+python e2nb.py
+```
+
+The GUI sidebar is organized into four sections:
+
+- **Sources**: Email (IMAP/POP3), SMTP Receiver, RSS Feeds, Web Monitor, HTTP Monitor
+- **Notifications**: SMS, Voice, WhatsApp, Slack, Telegram, Discord, SMTP, Webhook
+- **Configuration**: General settings
+- **Monitor**: Start/stop monitoring, real-time logs
+
+Features:
+- Protocol selection (IMAP/POP3) with dynamic form fields
+- Real-time log display with color-coded severity levels
+- Status indicator showing monitoring state
+- Connection test functionality for both IMAP and POP3
+- Settings persistence to config.ini
+
+Controls:
+- **Start Monitoring**: Begin monitoring all enabled sources
+- **Stop Monitoring**: Gracefully stop monitoring
+- **Save Settings**: Write current configuration to config.ini
+- **Tools > Test Email Connection**: Verify email credentials (IMAP or POP3)
+- **Tools > Clear Logs**: Clear the log display
+
+### Headless Version
+
+```bash
+# Basic usage
+python e2nb-headless.py
+
+# Custom configuration file
+python e2nb-headless.py -c /etc/e2nb/config.ini
+
+# Custom log file
+python e2nb-headless.py -l /var/log/e2nb.log
+
+# Verbose (debug) logging
+python e2nb-headless.py -v
+
+# Disable console output (log to file only)
+python e2nb-headless.py --no-console
+
+# Test configuration and exit
+python e2nb-headless.py --test
+
+# Show version
+python e2nb-headless.py --version
+```
+
+#### Command-Line Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `-c, --config` | Path to configuration file (default: config.ini) |
+| `-l, --log-file` | Path to log file (default: email_monitor.log) |
+| `-v, --verbose` | Enable debug-level logging |
+| `--no-console` | Disable console output |
+| `--test` | Validate configuration and test connections |
+| `--version` | Display version and exit |
+
+#### Signal Handling
+
+| Signal | Action |
+|--------|--------|
+| `SIGINT` (Ctrl+C) | Graceful shutdown |
+| `SIGTERM` | Graceful shutdown |
+| `SIGHUP` | Reload configuration |
+
+#### Running as a Systemd Service
+
+Create `/etc/systemd/system/e2nb.service`:
+
+```ini
+[Unit]
+Description=E2NB Email Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=e2nb
+WorkingDirectory=/opt/e2nb
+ExecStart=/usr/bin/python3 /opt/e2nb/e2nb-headless.py -c /etc/e2nb/config.ini -l /var/log/e2nb.log --no-console
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable e2nb
+sudo systemctl start e2nb
+sudo systemctl status e2nb
+
+# Reload configuration without restart
+sudo systemctl reload e2nb
+```
+
 ## API Reference
 
 ### Core Classes
@@ -315,14 +456,13 @@ from e2nb_core import NotificationDispatcher, load_config
 config = load_config()
 dispatcher = NotificationDispatcher(config)
 
-# Check if any method is enabled
 if dispatcher.has_any_enabled():
     results = dispatcher.dispatch(notification, callback=on_result)
 ```
 
 #### EmailNotification
 
-Data class representing an email ready for notification.
+Data class representing a notification from any source.
 
 ```python
 from e2nb_core import EmailNotification
@@ -334,44 +474,60 @@ notification = EmailNotification(
     body='Email body content'
 )
 
-# Get combined message
 message = notification.notification_message  # "Test Subject: Email body content"
-
-# Truncate for SMS
 sms_text = notification.truncate_for_sms(160)
 ```
 
-#### NotificationResult
+#### SmtpReceiver
 
-Result object returned by notification functions.
+Local SMTP server for receiving emails via push.
 
 ```python
-result = send_sms_via_twilio(...)
+from e2nb_core import SmtpReceiver, SmtpReceiverConfig
 
-if result.success:
-    print(f"Sent via {result.service}: {result.sid}")
-else:
-    print(f"Failed: {result.message}")
+config = SmtpReceiverConfig(enabled=True, host='0.0.0.0', port=2525)
+receiver = SmtpReceiver(config, callback=on_email_received)
+receiver.start()
+# ...
+receiver.stop()
 ```
 
 ### Configuration Classes
 
 ```python
 from e2nb_core import (
-    EmailConfig,
-    TwilioConfig,
-    SlackConfig,
-    TelegramConfig,
-    DiscordConfig,
-    WebhookConfig,
-    AppSettings
+    EmailConfig,       # IMAP/POP3 email settings
+    TwilioConfig,      # SMS and Voice
+    SlackConfig,       # Slack
+    TelegramConfig,    # Telegram
+    DiscordConfig,     # Discord
+    WebhookConfig,     # Custom webhooks
+    SmtpReceiverConfig, # Local SMTP receiver
+    AppSettings        # General settings
+)
+```
+
+### Email Operations
+
+```python
+from e2nb_core import (
+    # IMAP
+    connect_to_imap, fetch_unread_emails, mark_as_read,
+    # POP3
+    connect_to_pop3, fetch_pop3_emails, delete_pop3_message,
+    # Shared
+    extract_email_body, decode_email_subject, get_sender_email, check_email_filter
 )
 
-config = load_config()
+# IMAP
+imap = connect_to_imap('imap.gmail.com', 993, 'user@gmail.com', 'password')
+emails = fetch_unread_emails(imap, max_emails=5)
+imap.logout()
 
-email = EmailConfig.from_config(config)
-twilio = TwilioConfig.from_config(config, 'Twilio')
-slack = SlackConfig.from_config(config)
+# POP3
+pop3 = connect_to_pop3('pop.gmail.com', 995, 'user@gmail.com', 'password')
+emails = fetch_pop3_emails(pop3, max_emails=5)
+pop3.quit()
 ```
 
 ### Validation Functions
@@ -379,39 +535,10 @@ slack = SlackConfig.from_config(config)
 ```python
 from e2nb_core import validate_url, validate_phone_number, validate_email, sanitize_twiml
 
-validate_url('https://example.com')  # True
-validate_phone_number('+15551234567')  # True
-validate_email('user@example.com')  # True
-
-safe_text = sanitize_twiml('<script>alert("xss")</script>')
-```
-
-### IMAP Operations
-
-```python
-from e2nb_core import (
-    connect_to_imap,
-    fetch_unread_emails,
-    extract_email_body,
-    decode_email_subject,
-    get_sender_email,
-    mark_as_read,
-    check_email_filter
-)
-
-imap = connect_to_imap('imap.gmail.com', 993, 'user@gmail.com', 'password')
-emails = fetch_unread_emails(imap, max_emails=5)
-
-for email_id, msg in emails:
-    sender = get_sender_email(msg)
-    subject = decode_email_subject(msg)
-    body = extract_email_body(msg)
-
-    if check_email_filter(sender, ['@allowed-domain.com']):
-        # Process email
-        mark_as_read(imap, email_id)
-
-imap.logout()
+validate_url('https://example.com')      # True
+validate_phone_number('+15551234567')     # True
+validate_email('user@example.com')        # True
+safe_text = sanitize_twiml('<b>hello</b>')  # "hello"
 ```
 
 ## Logging
@@ -431,35 +558,30 @@ imap.logout()
 | WARNING | Non-critical issues |
 | ERROR | Failures requiring attention |
 
-### Example Output
-
-```
-[2024-12-05 10:15:30] INFO: E2NB Daemon v1.0.0 starting...
-[2024-12-05 10:15:30] INFO: Configuration loaded from config.ini
-[2024-12-05 10:15:30] INFO: Enabled notification methods: SMS, Slack, Discord
-[2024-12-05 10:15:31] INFO: Connected to IMAP server imap.gmail.com:993
-[2024-12-05 10:15:32] INFO: Found 2 unread email(s)
-[2024-12-05 10:15:32] INFO: Processing email from user@example.com: Meeting Reminder...
-[2024-12-05 10:15:33] INFO: [SMS] Notification sent: Sent to +15559876543
-[2024-12-05 10:15:33] INFO: [Slack] Notification sent: Posted to #notifications
-[2024-12-05 10:15:34] INFO: Marked email 456 as read
-```
-
 ## Troubleshooting
 
-### IMAP Connection Failures
+### Email Connection Failures
 
 | Issue | Solution |
 |-------|----------|
-| Authentication failed | Verify username/password; use app-specific password if 2FA enabled |
+| IMAP authentication failed | Verify username/password; use app-specific password if 2FA enabled |
+| POP3 authentication failed | Same as IMAP; also verify POP3 is enabled in mail server settings |
 | Connection timeout | Check network connectivity; verify server hostname and port |
 | SSL certificate error | Ensure system CA certificates are up to date |
 
 ### Gmail-Specific Issues
 
-1. Enable "Less secure app access" or use App Passwords
-2. Enable IMAP in Gmail settings (Settings > See all settings > Forwarding and POP/IMAP)
-3. If using 2FA, generate an App Password at https://myaccount.google.com/apppasswords
+1. Enable IMAP/POP in Gmail settings (Settings > See all settings > Forwarding and POP/IMAP)
+2. If using 2FA, generate an App Password at https://myaccount.google.com/apppasswords
+3. Use the App Password in the `password` field
+
+### SMTP Receiver Issues
+
+| Issue | Solution |
+|-------|----------|
+| Port already in use | Change the `port` setting or stop the conflicting service |
+| Not receiving emails | Verify firewall allows inbound connections on the configured port |
+| Authentication failures | Check `use_auth`, `username`, and `password` settings |
 
 ### Notification Failures
 
@@ -469,6 +591,7 @@ imap.logout()
 | Slack | Invalid token; bot not in channel; missing permissions |
 | Telegram | Invalid bot token; bot not started by user; invalid chat ID |
 | Discord | Invalid webhook URL; webhook deleted |
+| SMTP | Invalid credentials; TLS required but not enabled; blocked port |
 
 ### Headless Mode Issues
 
