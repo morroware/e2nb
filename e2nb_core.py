@@ -181,16 +181,23 @@ class EmailConfig:
         section = config['Email'] if 'Email' in config else {}
         filter_str = section.get('filter_emails', '')
         filters = [f.strip().lower() for f in filter_str.split(',') if f.strip()]
+
+        # Validate TLS mode
+        tls_mode = section.get('tls_mode', TLS_MODE_IMPLICIT)
+        if tls_mode not in (TLS_MODE_IMPLICIT, TLS_MODE_EXPLICIT, TLS_MODE_NONE):
+            logger.warning(f"Invalid TLS mode '{tls_mode}', defaulting to implicit")
+            tls_mode = TLS_MODE_IMPLICIT
+
         return cls(
             protocol=section.get('protocol', 'imap').lower(),
             imap_server=section.get('imap_server', 'imap.gmail.com'),
-            imap_port=int(section.get('imap_port', DEFAULT_IMAP_PORT)),
+            imap_port=safe_int(section.get('imap_port'), DEFAULT_IMAP_PORT, min_val=1, max_val=65535),
             pop3_server=section.get('pop3_server', 'pop.gmail.com'),
-            pop3_port=int(section.get('pop3_port', str(DEFAULT_POP3_PORT))),
+            pop3_port=safe_int(section.get('pop3_port'), DEFAULT_POP3_PORT, min_val=1, max_val=65535),
             username=section.get('username', ''),
             password=section.get('password', ''),
             filter_emails=filters,
-            tls_mode=section.get('tls_mode', TLS_MODE_IMPLICIT),
+            tls_mode=tls_mode,
             verify_ssl=section.getboolean('verify_ssl', fallback=True),
             ca_bundle=section.get('ca_bundle', ''),
             oauth2_enabled=section.getboolean('oauth2_enabled', fallback=False),
@@ -198,8 +205,8 @@ class EmailConfig:
             oauth2_client_secret=section.get('oauth2_client_secret', ''),
             oauth2_refresh_token=section.get('oauth2_refresh_token', ''),
             oauth2_token_url=section.get('oauth2_token_url', ''),
-            connection_timeout=int(section.get('connection_timeout', str(DEFAULT_CONNECTION_TIMEOUT))),
-            max_emails_per_check=int(section.get('max_emails_per_check', str(MAX_EMAILS_PER_CHECK))),
+            connection_timeout=safe_int(section.get('connection_timeout'), DEFAULT_CONNECTION_TIMEOUT, min_val=1, max_val=300),
+            max_emails_per_check=safe_int(section.get('max_emails_per_check'), MAX_EMAILS_PER_CHECK, min_val=1, max_val=100),
         )
 
 
@@ -330,7 +337,7 @@ class SmtpConfig:
         return cls(
             enabled=section.getboolean('enabled', fallback=False),
             smtp_server=section.get('smtp_server', 'smtp.gmail.com'),
-            smtp_port=int(section.get('smtp_port', '587')),
+            smtp_port=safe_int(section.get('smtp_port'), 587, min_val=1, max_val=65535),
             use_tls=section.getboolean('use_tls', fallback=True),
             username=section.get('username', ''),
             password=section.get('password', ''),
@@ -362,7 +369,7 @@ class SmtpReceiverConfig:
         return cls(
             enabled=section.getboolean('enabled', fallback=False),
             host=section.get('host', '0.0.0.0'),
-            port=int(section.get('port', '2525')),
+            port=safe_int(section.get('port'), 2525, min_val=1, max_val=65535),
             use_auth=section.getboolean('use_auth', fallback=False),
             username=section.get('username', ''),
             password=section.get('password', ''),
@@ -392,17 +399,27 @@ class RssFeedConfig:
 
         # Parse feeds from JSON string
         feeds_str = section.get('feeds', '[]')
+        feeds = []
         try:
-            feeds = json.loads(feeds_str)
-        except json.JSONDecodeError:
-            feeds = []
+            parsed = json.loads(feeds_str)
+            if isinstance(parsed, list):
+                # Validate each feed has required fields
+                for feed in parsed:
+                    if isinstance(feed, dict) and 'url' in feed:
+                        feeds.append(feed)
+                    else:
+                        logger.warning(f"Invalid RSS feed entry (missing 'url'): {feed}")
+            else:
+                logger.warning("RSS feeds config must be a JSON array")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse RSS feeds JSON: {e}")
 
         return cls(
             enabled=section.getboolean('enabled', fallback=False),
             feeds=feeds,
-            check_interval=int(section.get('check_interval', '300')),
-            max_age_hours=int(section.get('max_age_hours', str(DEFAULT_RSS_MAX_AGE_HOURS))),
-            max_items_per_check=int(section.get('max_items_per_check', str(DEFAULT_RSS_MAX_ITEMS)))
+            check_interval=safe_int(section.get('check_interval'), 300, min_val=60, max_val=86400),
+            max_age_hours=safe_int(section.get('max_age_hours'), DEFAULT_RSS_MAX_AGE_HOURS, min_val=1, max_val=168),
+            max_items_per_check=safe_int(section.get('max_items_per_check'), DEFAULT_RSS_MAX_ITEMS, min_val=1, max_val=100)
         )
 
 
@@ -422,15 +439,25 @@ class WebMonitorConfig:
 
         # Parse pages from JSON string
         pages_str = section.get('pages', '[]')
+        pages = []
         try:
-            pages = json.loads(pages_str)
-        except json.JSONDecodeError:
-            pages = []
+            parsed = json.loads(pages_str)
+            if isinstance(parsed, list):
+                # Validate each page has required fields
+                for page in parsed:
+                    if isinstance(page, dict) and 'url' in page:
+                        pages.append(page)
+                    else:
+                        logger.warning(f"Invalid web page entry (missing 'url'): {page}")
+            else:
+                logger.warning("WebMonitor pages config must be a JSON array")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse WebMonitor pages JSON: {e}")
 
         return cls(
             enabled=section.getboolean('enabled', fallback=False),
             pages=pages,
-            check_interval=int(section.get('check_interval', str(DEFAULT_WEB_CHECK_INTERVAL)))
+            check_interval=safe_int(section.get('check_interval'), DEFAULT_WEB_CHECK_INTERVAL, min_val=60, max_val=86400)
         )
 
 
@@ -450,15 +477,25 @@ class HttpEndpointConfig:
 
         # Parse endpoints from JSON string
         endpoints_str = section.get('endpoints', '[]')
+        endpoints = []
         try:
-            endpoints = json.loads(endpoints_str)
-        except json.JSONDecodeError:
-            endpoints = []
+            parsed = json.loads(endpoints_str)
+            if isinstance(parsed, list):
+                # Validate each endpoint has required fields
+                for endpoint in parsed:
+                    if isinstance(endpoint, dict) and 'url' in endpoint:
+                        endpoints.append(endpoint)
+                    else:
+                        logger.warning(f"Invalid HTTP endpoint entry (missing 'url'): {endpoint}")
+            else:
+                logger.warning("HttpMonitor endpoints config must be a JSON array")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse HttpMonitor endpoints JSON: {e}")
 
         return cls(
             enabled=section.getboolean('enabled', fallback=False),
             endpoints=endpoints,
-            check_interval=int(section.get('check_interval', '60'))
+            check_interval=safe_int(section.get('check_interval'), 60, min_val=10, max_val=86400)
         )
 
 
@@ -518,15 +555,52 @@ class AppSettings:
         if 'Settings' not in config:
             return cls()
         section = config['Settings']
+
+        # Safe integer conversion with validation
+        def _safe_int(val, default, min_v=None, max_v=None):
+            try:
+                result = int(val)
+                if min_v is not None and result < min_v:
+                    return min_v
+                if max_v is not None and result > max_v:
+                    return max_v
+                return result
+            except (ValueError, TypeError):
+                return default
+
         return cls(
-            max_sms_length=int(section.get('max_sms_length', DEFAULT_MAX_SMS_LENGTH)),
-            check_interval=int(section.get('check_interval', DEFAULT_CHECK_INTERVAL))
+            max_sms_length=_safe_int(section.get('max_sms_length'), DEFAULT_MAX_SMS_LENGTH, min_v=100, max_v=10000),
+            check_interval=_safe_int(section.get('check_interval'), DEFAULT_CHECK_INTERVAL, min_v=10, max_v=86400)
         )
 
 
 # =============================================================================
 # Validation Functions
 # =============================================================================
+
+def safe_int(value: Any, default: int, min_val: Optional[int] = None, max_val: Optional[int] = None) -> int:
+    """
+    Safely convert a value to an integer with bounds checking.
+
+    Args:
+        value: Value to convert.
+        default: Default value if conversion fails.
+        min_val: Minimum allowed value (optional).
+        max_val: Maximum allowed value (optional).
+
+    Returns:
+        Integer value within bounds, or default on error.
+    """
+    try:
+        result = int(value)
+        if min_val is not None and result < min_val:
+            return min_val
+        if max_val is not None and result > max_val:
+            return max_val
+        return result
+    except (ValueError, TypeError):
+        return default
+
 
 def validate_url(url: str, schemes: Optional[List[str]] = None) -> bool:
     """
@@ -1291,16 +1365,35 @@ def test_pop3_connection(config: EmailConfig) -> Tuple[bool, str]:
         Tuple of (success, message).
     """
     try:
+        # Get OAuth2 access token if enabled
+        oauth2_access_token = ""
+        if config.oauth2_enabled and config.oauth2_refresh_token:
+            success, token, error = refresh_oauth2_token(
+                config.oauth2_client_id,
+                config.oauth2_client_secret,
+                config.oauth2_refresh_token,
+                config.oauth2_token_url or "https://oauth2.googleapis.com/token"
+            )
+            if not success:
+                return False, f"OAuth2 token refresh failed: {error}"
+            oauth2_access_token = token
+
         pop3 = connect_to_pop3(
             config.pop3_server,
             config.pop3_port,
             config.username,
-            config.password
+            config.password,
+            timeout=config.connection_timeout,
+            tls_mode=config.tls_mode,
+            verify_ssl=config.verify_ssl,
+            ca_bundle=config.ca_bundle,
+            oauth2_access_token=oauth2_access_token
         )
         if pop3:
             count, size = pop3.stat()
             pop3.quit()
-            return True, f"Connected to POP3 server ({count} messages, {size} bytes)"
+            tls_info = f" ({config.tls_mode} TLS)" if config.tls_mode != TLS_MODE_NONE else " (no TLS)"
+            return True, f"Connected to POP3 server{tls_info} ({count} messages, {size} bytes)"
         return False, "Failed to connect to POP3 server"
     except Exception as e:
         return False, f"POP3 connection error: {e}"
@@ -1600,10 +1693,16 @@ def send_slack_message(
         return NotificationResult(False, "Slack", "Token or channel not configured")
 
     # Handle channel format:
-    # - Channel IDs start with C (public) or G (private/group) - use as-is
+    # - Channel IDs start with C (public), G (private/group), or D (DM) - use as-is
     # - Channel names should have # prefix added
     channel = channel.strip()
-    if not (channel.startswith('C') or channel.startswith('G')) and not channel.startswith('#'):
+    # Check if it looks like a channel ID (starts with C, G, or D and is alphanumeric)
+    is_channel_id = (
+        len(channel) > 1 and
+        channel[0] in ('C', 'G', 'D') and
+        channel[1:].replace('_', '').isalnum()
+    )
+    if not is_channel_id and not channel.startswith('#'):
         channel = f'#{channel}'
 
     try:
@@ -2012,7 +2111,27 @@ class NotificationDispatcher:
         self.discord = DiscordConfig.from_config(config)
         self.webhook = WebhookConfig.from_config(config)
         self.smtp = SmtpConfig.from_config(config)
-        self.http_session = create_http_session()
+        self._http_session: Optional[requests.Session] = None
+
+    @property
+    def http_session(self) -> requests.Session:
+        """Lazy-load HTTP session to avoid creating unused sessions."""
+        if self._http_session is None:
+            self._http_session = create_http_session()
+        return self._http_session
+
+    def close(self):
+        """Close the HTTP session to free resources."""
+        if self._http_session is not None:
+            try:
+                self._http_session.close()
+            except Exception:
+                pass
+            self._http_session = None
+
+    def __del__(self):
+        """Ensure session is closed when dispatcher is garbage collected."""
+        self.close()
 
     def has_any_enabled(self) -> bool:
         """Check if any notification method is enabled."""
@@ -2175,15 +2294,34 @@ def test_imap_connection(config: EmailConfig) -> Tuple[bool, str]:
         Tuple of (success, message).
     """
     try:
+        # Get OAuth2 access token if enabled
+        oauth2_access_token = ""
+        if config.oauth2_enabled and config.oauth2_refresh_token:
+            success, token, error = refresh_oauth2_token(
+                config.oauth2_client_id,
+                config.oauth2_client_secret,
+                config.oauth2_refresh_token,
+                config.oauth2_token_url or "https://oauth2.googleapis.com/token"
+            )
+            if not success:
+                return False, f"OAuth2 token refresh failed: {error}"
+            oauth2_access_token = token
+
         imap = connect_to_imap(
             config.imap_server,
             config.imap_port,
             config.username,
-            config.password
+            config.password,
+            timeout=config.connection_timeout,
+            tls_mode=config.tls_mode,
+            verify_ssl=config.verify_ssl,
+            ca_bundle=config.ca_bundle,
+            oauth2_access_token=oauth2_access_token
         )
         if imap:
             imap.logout()
-            return True, f"Successfully connected to {config.imap_server}"
+            tls_info = f" ({config.tls_mode} TLS)" if config.tls_mode != TLS_MODE_NONE else " (no TLS)"
+            return True, f"Successfully connected to {config.imap_server}{tls_info}"
         return False, "Connection failed - check credentials"
     except Exception as e:
         return False, str(e)
@@ -2315,13 +2453,20 @@ class MonitorState:
         self._state['seen_pop3_messages'].add(message_hash)
 
     def cleanup_old_pop3_messages(self, max_items: int = 1000):
-        """Limit stored POP3 message hashes to prevent unbounded growth."""
+        """Limit stored POP3 message hashes to prevent unbounded growth.
+
+        Note: Since sets are unordered, when we exceed max_items we simply
+        keep an arbitrary subset. For true FIFO behavior, consider using
+        an OrderedDict or tracking timestamps with each message hash.
+        """
         if 'seen_pop3_messages' in self._state:
             items = self._state['seen_pop3_messages']
             if len(items) > max_items:
-                # Convert to list, keep recent items, convert back to set
+                # Keep only max_items entries - this is arbitrary since sets are unordered
+                # but prevents unbounded memory growth
                 items_list = list(items)
-                self._state['seen_pop3_messages'] = set(items_list[-max_items:])
+                self._state['seen_pop3_messages'] = set(items_list[:max_items])
+                logger.debug(f"Cleaned up POP3 message cache: kept {max_items} of {len(items_list)} items")
 
     def get_imap_last_uid(self, server: str, username: str) -> int:
         """Get the last seen IMAP UID for persistent tracking."""
@@ -2356,13 +2501,20 @@ class MonitorState:
         self._state['http_endpoint_status'][url] = status
 
     def cleanup_old_rss_items(self, feed_url: str, max_items: int = 1000):
-        """Limit stored RSS items to prevent unbounded growth."""
+        """Limit stored RSS items to prevent unbounded growth.
+
+        Note: Since sets are unordered, when we exceed max_items we simply
+        keep an arbitrary subset. For true FIFO behavior, consider using
+        an OrderedDict or tracking timestamps with each item ID.
+        """
         if feed_url in self._state.get('seen_rss_items', {}):
             items = self._state['seen_rss_items'][feed_url]
             if len(items) > max_items:
-                # Convert to list, keep recent items, convert back to set
+                # Keep only max_items entries - this is arbitrary since sets are unordered
+                # but prevents unbounded memory growth
                 items_list = list(items)
-                self._state['seen_rss_items'][feed_url] = set(items_list[-max_items:])
+                self._state['seen_rss_items'][feed_url] = set(items_list[:max_items])
+                logger.debug(f"Cleaned up RSS item cache for {feed_url}: kept {max_items} of {len(items_list)} items")
 
 
 # =============================================================================

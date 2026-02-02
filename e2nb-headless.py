@@ -57,6 +57,7 @@ from e2nb_core import (
     DEFAULT_POP3_PORT,
     CONFIG_FILE_PATH,
     LOG_FILE_PATH,
+    safe_int,
     logger,
 )
 
@@ -84,6 +85,7 @@ class EmailMonitorDaemon:
         self.stop_event = threading.Event()
         self.monitor_thread: Optional[threading.Thread] = None
         self.smtp_receiver: Optional[SmtpReceiver] = None
+        self._config_lock = threading.Lock()  # Thread safety for config reload
 
     def load_configuration(self) -> bool:
         """
@@ -93,8 +95,24 @@ class EmailMonitorDaemon:
             True if configuration is valid, False otherwise.
         """
         try:
-            self.config = load_config(self.config_file)
-            self.dispatcher = NotificationDispatcher(self.config)
+            new_config = load_config(self.config_file)
+            new_dispatcher = NotificationDispatcher(new_config)
+
+            # Validate new configuration before swapping
+            old_dispatcher = self.dispatcher
+            old_config = self.config
+
+            # Atomically swap configuration (thread-safe)
+            with self._config_lock:
+                self.config = new_config
+                self.dispatcher = new_dispatcher
+
+            # Close old dispatcher to free resources
+            if old_dispatcher is not None:
+                try:
+                    old_dispatcher.close()
+                except Exception as e:
+                    logging.debug(f"Error closing old dispatcher: {e}")
 
             # Validate configuration
             if not self._validate_configuration():
@@ -139,15 +157,13 @@ class EmailMonitorDaemon:
                     return False
 
         # Validate check interval
+        raw_interval = self.config.get('Settings', 'check_interval', fallback=str(DEFAULT_CHECK_INTERVAL))
+        check_interval = safe_int(raw_interval, DEFAULT_CHECK_INTERVAL, min_val=10, max_val=86400)
         try:
-            check_interval = int(
-                self.config.get('Settings', 'check_interval', fallback=str(DEFAULT_CHECK_INTERVAL))
-            )
-            if check_interval <= 0:
-                raise ValueError("Check interval must be positive")
-        except ValueError as e:
-            logging.error(f"Invalid check_interval in config.ini: {e}")
-            return False
+            if check_interval != int(raw_interval):
+                logging.warning(f"Invalid check_interval '{raw_interval}' in config.ini, using {check_interval} seconds")
+        except ValueError:
+            logging.warning(f"Invalid check_interval '{raw_interval}' in config.ini, using {check_interval} seconds")
 
         return True
 
@@ -241,6 +257,13 @@ class EmailMonitorDaemon:
             if self.monitor_thread.is_alive():
                 logging.warning("Monitor thread did not stop cleanly")
 
+        # Close dispatcher to free HTTP session resources
+        if self.dispatcher is not None:
+            try:
+                self.dispatcher.close()
+            except Exception as e:
+                logging.debug(f"Error closing dispatcher: {e}")
+
         logging.info("E2NB daemon stopped")
 
     def _on_smtp_received(self, notification: EmailNotification):
@@ -273,28 +296,35 @@ class EmailMonitorDaemon:
             imap = None
             pop3 = None
             try:
-                # Get configuration values
-                check_interval = int(
-                    self.config.get('Settings', 'check_interval', fallback=str(DEFAULT_CHECK_INTERVAL))
+                # Get configuration values (thread-safe access)
+                with self._config_lock:
+                    config = self.config
+                    dispatcher = self.dispatcher
+
+                check_interval = safe_int(
+                    config.get('Settings', 'check_interval', fallback=str(DEFAULT_CHECK_INTERVAL)),
+                    DEFAULT_CHECK_INTERVAL,
+                    min_val=10,
+                    max_val=86400
                 )
                 filter_emails = [
                     f.strip().lower()
-                    for f in self.config.get('Email', 'filter_emails', fallback='').split(',')
+                    for f in config.get('Email', 'filter_emails', fallback='').split(',')
                     if f.strip()
                 ]
 
-                email_username = self.config.get('Email', 'username', fallback='')
-                protocol = self.config.get('Email', 'protocol', fallback='imap').lower()
+                email_username = config.get('Email', 'username', fallback='')
+                protocol = config.get('Email', 'protocol', fallback='imap').lower()
 
                 # =====================================================
                 # Check Email (IMAP or POP3)
                 # =====================================================
                 if email_username and protocol == 'imap':
                     imap = connect_to_imap(
-                        self.config.get('Email', 'imap_server'),
-                        int(self.config.get('Email', 'imap_port', fallback=str(DEFAULT_IMAP_PORT))),
+                        config.get('Email', 'imap_server'),
+                        safe_int(config.get('Email', 'imap_port'), DEFAULT_IMAP_PORT, min_val=1, max_val=65535),
                         email_username,
-                        self.config.get('Email', 'password')
+                        config.get('Email', 'password')
                     )
 
                     if imap:
@@ -315,10 +345,10 @@ class EmailMonitorDaemon:
 
                 elif email_username and protocol == 'pop3':
                     pop3 = connect_to_pop3(
-                        self.config.get('Email', 'pop3_server'),
-                        int(self.config.get('Email', 'pop3_port', fallback=str(DEFAULT_POP3_PORT))),
+                        config.get('Email', 'pop3_server'),
+                        safe_int(config.get('Email', 'pop3_port'), DEFAULT_POP3_PORT, min_val=1, max_val=65535),
                         email_username,
-                        self.config.get('Email', 'password')
+                        config.get('Email', 'password')
                     )
 
                     if pop3:
@@ -425,9 +455,6 @@ class EmailMonitorDaemon:
 
                 # Wait for next check cycle
                 if not self.stop_event.is_set():
-                    check_interval = int(
-                        self.config.get('Settings', 'check_interval', fallback=str(DEFAULT_CHECK_INTERVAL))
-                    )
                     logging.debug(f"Sleeping for {check_interval} seconds")
                     self.stop_event.wait(check_interval)
 
