@@ -491,10 +491,13 @@ class EmailMonitorDaemon:
                             for uid, msg in unread_emails:
                                 if self.stop_event.is_set():
                                     break
-                                success = self._process_email_by_uid(imap, uid, msg, email_config.filter_emails)
-                                if success:
-                                    # Update last seen UID only after successful dispatch
-                                    monitor_state.set_imap_last_uid(imap_key_server, imap_key_user, uid)
+                                self._process_email_by_uid(imap, uid, msg, email_config.filter_emails)
+                                # Always advance last_uid regardless of filter/dispatch
+                                # outcome. Messages are processed in ascending UID order,
+                                # so advancing prevents re-fetching the same message
+                                # every cycle (starvation) and avoids skipping older
+                                # UIDs when a newer one succeeds first.
+                                monitor_state.set_imap_last_uid(imap_key_server, imap_key_user, uid)
                         else:
                             logging.warning("Failed to connect to IMAP server")
 
@@ -536,8 +539,6 @@ class EmailMonitorDaemon:
                                 if self.stop_event.is_set():
                                     break
                                 sender = get_sender_email(msg)
-                                if email_config.filter_emails and not check_email_filter(sender, email_config.filter_emails):
-                                    continue
                                 subject = decode_email_subject(msg)
                                 body = extract_email_body(msg)
 
@@ -548,6 +549,14 @@ class EmailMonitorDaemon:
 
                                 # Skip if already processed
                                 if monitor_state.is_pop3_message_seen(msg_hash):
+                                    continue
+
+                                # Check filter AFTER hashing so filtered messages are
+                                # still marked as seen — POP3 has no server-side flags,
+                                # so without this the same non-matching message would
+                                # be re-fetched and re-filtered every poll cycle.
+                                if email_config.filter_emails and not check_email_filter(sender, email_config.filter_emails):
+                                    monitor_state.mark_pop3_message_seen(msg_hash)
                                     continue
 
                                 notification = EmailNotification(
