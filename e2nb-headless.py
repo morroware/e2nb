@@ -30,13 +30,16 @@ from e2nb_core import (
     connect_to_imap,
     connect_to_pop3,
     fetch_unread_emails,
+    fetch_unread_emails_by_uid,
     fetch_pop3_emails,
     delete_pop3_message,
     extract_email_body,
     decode_email_subject,
     get_sender_email,
     mark_as_read,
+    mark_as_read_by_uid,
     check_email_filter,
+    refresh_oauth2_token,
     EmailNotification,
     NotificationDispatcher,
     NotificationResult,
@@ -83,16 +86,21 @@ class EmailMonitorDaemon:
         self.dispatcher: Optional[NotificationDispatcher] = None
         self.running = False
         self.stop_event = threading.Event()
+        self.reload_event = threading.Event()  # Signals config reload to monitor loop
         self.monitor_thread: Optional[threading.Thread] = None
         self.smtp_receiver: Optional[SmtpReceiver] = None
         self._config_lock = threading.Lock()  # Thread safety for config reload
+        self._smtp_receiver_config: Optional[SmtpReceiverConfig] = None  # Track SMTP config
 
-    def load_configuration(self) -> bool:
+    def load_configuration(self, is_reload: bool = False) -> bool:
         """
         Load and validate configuration.
 
         Validates the new configuration fully before swapping it in.
         If validation fails, the existing config/dispatcher remain active.
+
+        Args:
+            is_reload: Whether this is a configuration reload (triggers SMTP reconciliation).
 
         Returns:
             True if configuration is valid, False otherwise.
@@ -124,6 +132,12 @@ class EmailMonitorDaemon:
                 except Exception as e:
                     logging.debug(f"Error closing old dispatcher: {e}")
 
+            # Reconcile SMTP receiver on reload
+            if is_reload:
+                self._reconcile_smtp_receiver(new_config)
+                # Signal monitor loop to refresh source configs
+                self.reload_event.set()
+
             return True
         except ConfigurationError as e:
             logging.error(f"Configuration error: {e}")
@@ -131,6 +145,52 @@ class EmailMonitorDaemon:
         except Exception as e:
             logging.error(f"Failed to load configuration: {e}")
             return False
+
+    def _reconcile_smtp_receiver(self, new_config) -> None:
+        """
+        Reconcile SMTP receiver state after configuration reload.
+
+        Starts, stops, or restarts the SMTP receiver based on config changes.
+        """
+        new_smtp_config = SmtpReceiverConfig.from_config(new_config)
+        old_smtp_config = self._smtp_receiver_config
+
+        # Check if SMTP receiver settings changed
+        config_changed = (
+            old_smtp_config is None or
+            new_smtp_config.enabled != old_smtp_config.enabled or
+            new_smtp_config.host != old_smtp_config.host or
+            new_smtp_config.port != old_smtp_config.port or
+            new_smtp_config.use_auth != old_smtp_config.use_auth or
+            new_smtp_config.username != old_smtp_config.username or
+            new_smtp_config.password != old_smtp_config.password
+        )
+
+        if not config_changed:
+            return
+
+        # Stop existing receiver if running
+        if self.smtp_receiver and self.smtp_receiver.is_running:
+            logging.info("Stopping SMTP receiver for reconfiguration...")
+            self.smtp_receiver.stop()
+            self.smtp_receiver = None
+
+        # Start new receiver if enabled
+        if new_smtp_config.enabled:
+            if not AIOSMTPD_AVAILABLE:
+                logging.error("SMTP receiver enabled but aiosmtpd not installed")
+            else:
+                self.smtp_receiver = SmtpReceiver(
+                    config=new_smtp_config,
+                    callback=self._on_smtp_received,
+                )
+                success, msg = self.smtp_receiver.start()
+                if success:
+                    logging.info(f"SMTP receiver restarted: {msg}")
+                else:
+                    logging.error(f"Failed to restart SMTP receiver: {msg}")
+
+        self._smtp_receiver_config = new_smtp_config
 
     def _validate_configuration(self, config=None, dispatcher=None) -> bool:
         """
@@ -236,6 +296,7 @@ class EmailMonitorDaemon:
 
         # Start SMTP receiver if enabled
         smtp_recv_config = SmtpReceiverConfig.from_config(self.config)
+        self._smtp_receiver_config = smtp_recv_config  # Track initial config for reload reconciliation
         if smtp_recv_config.enabled:
             if not AIOSMTPD_AVAILABLE:
                 logging.error("SMTP receiver enabled but aiosmtpd not installed (pip install aiosmtpd)")
@@ -297,35 +358,60 @@ class EmailMonitorDaemon:
         self._dispatch_notification(notification)
 
     def _monitor_loop(self):
-        """Main monitoring loop."""
+        """Main monitoring loop with per-source interval tracking and UID-based IMAP."""
         # Initialize state for monitoring sources
         monitor_state = MonitorState()
 
-        # Load monitoring source configs
+        # Load monitoring source configs (will be refreshed on reload)
         rss_config = RssFeedConfig.from_config(self.config)
         web_config = WebMonitorConfig.from_config(self.config)
         http_config = HttpEndpointConfig.from_config(self.config)
 
-        # Log enabled sources
-        sources = []
-        if rss_config.enabled:
-            sources.append(f"RSS ({len(rss_config.feeds)} feeds)")
-        if web_config.enabled:
-            sources.append(f"Web ({len(web_config.pages)} pages)")
-        if http_config.enabled:
-            sources.append(f"HTTP ({len(http_config.endpoints)} endpoints)")
-        if sources:
-            logging.info(f"Enabled monitoring sources: {', '.join(sources)}")
+        # Track per-source next-run timestamps for respecting individual check_intervals
+        next_run_times = {
+            'email': 0.0,  # Email uses global check_interval
+            'rss': 0.0,
+            'web': 0.0,
+            'http': 0.0,
+        }
+
+        def _log_enabled_sources():
+            """Log enabled monitoring sources."""
+            sources = []
+            if rss_config.enabled:
+                sources.append(f"RSS ({len(rss_config.feeds)} feeds, {rss_config.check_interval}s)")
+            if web_config.enabled:
+                sources.append(f"Web ({len(web_config.pages)} pages, {web_config.check_interval}s)")
+            if http_config.enabled:
+                sources.append(f"HTTP ({len(http_config.endpoints)} endpoints, {http_config.check_interval}s)")
+            if sources:
+                logging.info(f"Enabled monitoring sources: {', '.join(sources)}")
+
+        _log_enabled_sources()
 
         while not self.stop_event.is_set():
             imap = None
             pop3 = None
             check_interval = DEFAULT_CHECK_INTERVAL  # Default in case of early exception
             try:
+                # Check for config reload signal
+                if self.reload_event.is_set():
+                    self.reload_event.clear()
+                    # Refresh monitoring source configs
+                    with self._config_lock:
+                        rss_config = RssFeedConfig.from_config(self.config)
+                        web_config = WebMonitorConfig.from_config(self.config)
+                        http_config = HttpEndpointConfig.from_config(self.config)
+                    logging.info("Monitoring source configs refreshed after reload")
+                    _log_enabled_sources()
+
                 # Get configuration values (thread-safe access)
                 with self._config_lock:
                     config = self.config
                     dispatcher = self.dispatcher
+
+                # Build EmailConfig for full TLS/OAuth2 support
+                email_config = EmailConfig.from_config(config)
 
                 check_interval = safe_int(
                     config.get('Settings', 'check_interval', fallback=str(DEFAULT_CHECK_INTERVAL)),
@@ -333,97 +419,144 @@ class EmailMonitorDaemon:
                     min_val=10,
                     max_val=86400
                 )
-                filter_emails = [
-                    f.strip().lower()
-                    for f in config.get('Email', 'filter_emails', fallback='').split(',')
-                    if f.strip()
-                ]
 
-                email_username = config.get('Email', 'username', fallback='')
-                protocol = config.get('Email', 'protocol', fallback='imap').lower()
+                current_time = time.time()
 
                 # =====================================================
-                # Check Email (IMAP or POP3)
+                # Check Email (IMAP or POP3) with full TLS/OAuth2 support
                 # =====================================================
-                if email_username and protocol == 'imap':
-                    imap = connect_to_imap(
-                        config.get('Email', 'imap_server'),
-                        safe_int(config.get('Email', 'imap_port'), DEFAULT_IMAP_PORT, min_val=1, max_val=65535),
-                        email_username,
-                        config.get('Email', 'password')
-                    )
-
-                    if imap:
-                        unread_emails = fetch_unread_emails(imap)
-                        email_count = len(unread_emails)
-
-                        if email_count > 0:
-                            logging.info(f"Found {email_count} unread email(s)")
-                        else:
-                            logging.debug("No unread emails found")
-
-                        for email_id, msg in unread_emails:
-                            if self.stop_event.is_set():
-                                break
-                            self._process_email(imap, email_id, msg, filter_emails)
-                    else:
-                        logging.warning("Failed to connect to IMAP server")
-
-                elif email_username and protocol == 'pop3':
-                    pop3 = connect_to_pop3(
-                        config.get('Email', 'pop3_server'),
-                        safe_int(config.get('Email', 'pop3_port'), DEFAULT_POP3_PORT, min_val=1, max_val=65535),
-                        email_username,
-                        config.get('Email', 'password')
-                    )
-
-                    if pop3:
-                        pop3_emails = fetch_pop3_emails(pop3)
-                        email_count = len(pop3_emails)
-
-                        if email_count > 0:
-                            logging.info(f"Found {email_count} email(s) via POP3")
-
-                        for msg_num, msg in pop3_emails:
-                            if self.stop_event.is_set():
-                                break
-                            sender = get_sender_email(msg)
-                            if filter_emails and not check_email_filter(sender, filter_emails):
-                                continue
-                            subject = decode_email_subject(msg)
-                            body = extract_email_body(msg)
-
-                            # Create hash to track this message and avoid duplicates
-                            msg_hash = hashlib.md5(
-                                f"{sender}{subject}{body[:500]}".encode()
-                            ).hexdigest()
-
-                            # Skip if already processed
-                            if monitor_state.is_pop3_message_seen(msg_hash):
-                                continue
-
-                            notification = EmailNotification(
-                                email_id=str(msg_num).encode(),
-                                sender=sender,
-                                subject=subject,
-                                body=body
+                if current_time >= next_run_times['email']:
+                    if email_config.username and email_config.protocol == 'imap':
+                        # Get OAuth2 access token if enabled
+                        oauth2_token = ""
+                        if email_config.oauth2_enabled:
+                            success, token, error = refresh_oauth2_token(
+                                email_config.oauth2_client_id,
+                                email_config.oauth2_client_secret,
+                                email_config.oauth2_refresh_token,
+                                email_config.oauth2_token_url or "https://oauth2.googleapis.com/token"
                             )
-
-                            # Dispatch and only delete/mark seen on success
-                            success = self._dispatch_notification(notification)
                             if success:
-                                monitor_state.mark_pop3_message_seen(msg_hash)
-                                delete_pop3_message(pop3, msg_num)
+                                oauth2_token = token
+                            else:
+                                logging.error(f"OAuth2 token refresh failed: {error}")
 
-                        # Cleanup old tracked messages
-                        monitor_state.cleanup_old_pop3_messages()
-                    else:
-                        logging.warning("Failed to connect to POP3 server")
+                        imap = connect_to_imap(
+                            email_config.imap_server,
+                            email_config.imap_port,
+                            email_config.username,
+                            email_config.password,
+                            timeout=email_config.connection_timeout,
+                            tls_mode=email_config.tls_mode,
+                            verify_ssl=email_config.verify_ssl,
+                            ca_bundle=email_config.ca_bundle,
+                            oauth2_access_token=oauth2_token
+                        )
+
+                        if imap:
+                            # Use UID-based fetching for persistent tracking across restarts
+                            imap_key_server = email_config.imap_server
+                            imap_key_user = email_config.username
+                            last_uid = monitor_state.get_imap_last_uid(imap_key_server, imap_key_user)
+
+                            unread_emails, highest_uid = fetch_unread_emails_by_uid(
+                                imap,
+                                max_emails=email_config.max_emails_per_check,
+                                last_seen_uid=last_uid
+                            )
+                            email_count = len(unread_emails)
+
+                            if email_count > 0:
+                                logging.info(f"Found {email_count} new unread email(s)")
+                            else:
+                                logging.debug("No new unread emails found")
+
+                            for uid, msg in unread_emails:
+                                if self.stop_event.is_set():
+                                    break
+                                success = self._process_email_by_uid(imap, uid, msg, email_config.filter_emails)
+                                if success:
+                                    # Update last seen UID only after successful dispatch
+                                    monitor_state.set_imap_last_uid(imap_key_server, imap_key_user, uid)
+                        else:
+                            logging.warning("Failed to connect to IMAP server")
+
+                    elif email_config.username and email_config.protocol == 'pop3':
+                        # Get OAuth2 access token if enabled
+                        oauth2_token = ""
+                        if email_config.oauth2_enabled:
+                            success, token, error = refresh_oauth2_token(
+                                email_config.oauth2_client_id,
+                                email_config.oauth2_client_secret,
+                                email_config.oauth2_refresh_token,
+                                email_config.oauth2_token_url or "https://oauth2.googleapis.com/token"
+                            )
+                            if success:
+                                oauth2_token = token
+                            else:
+                                logging.error(f"OAuth2 token refresh failed: {error}")
+
+                        pop3 = connect_to_pop3(
+                            email_config.pop3_server,
+                            email_config.pop3_port,
+                            email_config.username,
+                            email_config.password,
+                            timeout=email_config.connection_timeout,
+                            tls_mode=email_config.tls_mode,
+                            verify_ssl=email_config.verify_ssl,
+                            ca_bundle=email_config.ca_bundle,
+                            oauth2_access_token=oauth2_token
+                        )
+
+                        if pop3:
+                            pop3_emails = fetch_pop3_emails(pop3)
+                            email_count = len(pop3_emails)
+
+                            if email_count > 0:
+                                logging.info(f"Found {email_count} email(s) via POP3")
+
+                            for msg_num, msg in pop3_emails:
+                                if self.stop_event.is_set():
+                                    break
+                                sender = get_sender_email(msg)
+                                if email_config.filter_emails and not check_email_filter(sender, email_config.filter_emails):
+                                    continue
+                                subject = decode_email_subject(msg)
+                                body = extract_email_body(msg)
+
+                                # Create hash to track this message and avoid duplicates
+                                msg_hash = hashlib.md5(
+                                    f"{sender}{subject}{body[:500]}".encode()
+                                ).hexdigest()
+
+                                # Skip if already processed
+                                if monitor_state.is_pop3_message_seen(msg_hash):
+                                    continue
+
+                                notification = EmailNotification(
+                                    email_id=str(msg_num).encode(),
+                                    sender=sender,
+                                    subject=subject,
+                                    body=body
+                                )
+
+                                # Dispatch and only delete/mark seen on success
+                                success = self._dispatch_notification(notification)
+                                if success:
+                                    monitor_state.mark_pop3_message_seen(msg_hash)
+                                    delete_pop3_message(pop3, msg_num)
+
+                            # Cleanup old tracked messages
+                            monitor_state.cleanup_old_pop3_messages()
+                        else:
+                            logging.warning("Failed to connect to POP3 server")
+
+                    next_run_times['email'] = current_time + check_interval
 
                 # =====================================================
-                # Check RSS Feeds
+                # Check RSS Feeds (respecting per-source check_interval)
                 # =====================================================
-                if rss_config.enabled:
+                if rss_config.enabled and current_time >= next_run_times['rss']:
                     rss_events = check_rss_feeds(rss_config, monitor_state)
                     for event in rss_events:
                         if self.stop_event.is_set():
@@ -431,11 +564,12 @@ class EmailMonitorDaemon:
                         logging.info(f"[RSS] New item from '{event.source_name}': {event.title}")
                         notification = event.to_email_notification()
                         self._dispatch_notification(notification)
+                    next_run_times['rss'] = current_time + rss_config.check_interval
 
                 # =====================================================
-                # Check Web Pages
+                # Check Web Pages (respecting per-source check_interval)
                 # =====================================================
-                if web_config.enabled:
+                if web_config.enabled and current_time >= next_run_times['web']:
                     web_events = check_web_pages(web_config, monitor_state)
                     for event in web_events:
                         if self.stop_event.is_set():
@@ -443,11 +577,12 @@ class EmailMonitorDaemon:
                         logging.info(f"[Web] {event.title}")
                         notification = event.to_email_notification()
                         self._dispatch_notification(notification)
+                    next_run_times['web'] = current_time + web_config.check_interval
 
                 # =====================================================
-                # Check HTTP Endpoints
+                # Check HTTP Endpoints (respecting per-source check_interval)
                 # =====================================================
-                if http_config.enabled:
+                if http_config.enabled and current_time >= next_run_times['http']:
                     http_events = check_http_endpoints(http_config, monitor_state)
                     for event in http_events:
                         if self.stop_event.is_set():
@@ -458,6 +593,7 @@ class EmailMonitorDaemon:
                             logging.info(f"[HTTP] {event.title}")
                         notification = event.to_email_notification()
                         self._dispatch_notification(notification)
+                    next_run_times['http'] = current_time + http_config.check_interval
 
                 # Save monitoring state
                 monitor_state.save()
@@ -479,10 +615,84 @@ class EmailMonitorDaemon:
                     except Exception as e:
                         logging.debug(f"Error during POP3 quit: {e}")
 
-                # Wait for next check cycle
+                # Calculate sleep time as minimum of all pending intervals
                 if not self.stop_event.is_set():
-                    logging.debug(f"Sleeping for {check_interval} seconds")
-                    self.stop_event.wait(check_interval)
+                    current_time = time.time()
+                    pending_intervals = []
+                    if email_config.username:
+                        pending_intervals.append(max(0, next_run_times['email'] - current_time))
+                    if rss_config.enabled:
+                        pending_intervals.append(max(0, next_run_times['rss'] - current_time))
+                    if web_config.enabled:
+                        pending_intervals.append(max(0, next_run_times['web'] - current_time))
+                    if http_config.enabled:
+                        pending_intervals.append(max(0, next_run_times['http'] - current_time))
+
+                    # Sleep until the next source needs to run (minimum 1 second)
+                    sleep_time = max(1, min(pending_intervals)) if pending_intervals else check_interval
+                    logging.debug(f"Sleeping for {sleep_time:.1f} seconds until next check")
+                    self.stop_event.wait(sleep_time)
+
+    def _process_email_by_uid(self, imap, uid: int, msg, filter_emails: list) -> bool:
+        """
+        Process a single email using UID.
+
+        Args:
+            imap: IMAP connection.
+            uid: Email UID.
+            msg: Email message object.
+            filter_emails: List of email filter patterns.
+
+        Returns:
+            True if notification was sent successfully, False otherwise.
+        """
+        # Extract sender
+        sender_email = get_sender_email(msg)
+
+        # Apply filters
+        if filter_emails and not check_email_filter(sender_email, filter_emails):
+            logging.info(f"Email from {sender_email} does not match filters. Skipping.")
+            return False
+
+        # Extract email content
+        subject = decode_email_subject(msg)
+        body = extract_email_body(msg)
+
+        logging.info(f"Processing email UID {uid} from {sender_email}: {subject[:60]}...")
+
+        # Create notification
+        notification = EmailNotification(
+            email_id=str(uid).encode(),
+            sender=sender_email,
+            subject=subject,
+            body=body
+        )
+
+        # Dispatch notifications
+        results = self.dispatcher.dispatch(
+            notification,
+            callback=self._on_notification_result
+        )
+
+        # Check results
+        success_count = sum(1 for r in results if r.success)
+        failure_count = len(results) - success_count
+
+        if success_count > 0:
+            logging.info(
+                f"Notifications sent: {success_count} success, {failure_count} failed"
+            )
+            # Mark email as read using UID
+            if mark_as_read_by_uid(imap, uid):
+                logging.info(f"Marked email UID {uid} as read")
+            else:
+                logging.warning(f"Failed to mark email UID {uid} as read")
+            return True
+        else:
+            logging.warning(
+                f"No notifications were sent successfully for email UID {uid}"
+            )
+            return False
 
     def _dispatch_notification(self, notification: EmailNotification) -> bool:
         """
@@ -609,7 +819,7 @@ class SignalHandler:
         """
         logging.info("Received SIGHUP. Reloading configuration...")
         try:
-            if self.daemon.load_configuration():
+            if self.daemon.load_configuration(is_reload=True):
                 logging.info("Configuration reloaded successfully")
             else:
                 logging.error("Failed to reload configuration")
@@ -712,6 +922,22 @@ def test_configuration(config_file: str) -> bool:
     smtp_recv_enabled = daemon.config.getboolean('SmtpReceiver', 'enabled', fallback=False)
 
     if email_config.username:
+        # Get OAuth2 token if enabled
+        oauth2_token = ""
+        if email_config.oauth2_enabled:
+            print("\nRefreshing OAuth2 token...")
+            success, token, error = refresh_oauth2_token(
+                email_config.oauth2_client_id,
+                email_config.oauth2_client_secret,
+                email_config.oauth2_refresh_token,
+                email_config.oauth2_token_url or "https://oauth2.googleapis.com/token"
+            )
+            if success:
+                oauth2_token = token
+                print("  OAuth2 token refreshed successfully")
+            else:
+                print(f"  WARNING: OAuth2 token refresh failed: {error}")
+
         protocol = email_config.protocol
         if protocol == 'pop3':
             print(f"\nTesting POP3 connection...")
@@ -719,7 +945,12 @@ def test_configuration(config_file: str) -> bool:
                 email_config.pop3_server,
                 email_config.pop3_port,
                 email_config.username,
-                email_config.password
+                email_config.password,
+                timeout=email_config.connection_timeout,
+                tls_mode=email_config.tls_mode,
+                verify_ssl=email_config.verify_ssl,
+                ca_bundle=email_config.ca_bundle,
+                oauth2_access_token=oauth2_token
             )
             if pop3:
                 print(f"  Connected to {email_config.pop3_server}:{email_config.pop3_port}")
@@ -738,7 +969,12 @@ def test_configuration(config_file: str) -> bool:
                 email_config.imap_server,
                 email_config.imap_port,
                 email_config.username,
-                email_config.password
+                email_config.password,
+                timeout=email_config.connection_timeout,
+                tls_mode=email_config.tls_mode,
+                verify_ssl=email_config.verify_ssl,
+                ca_bundle=email_config.ca_bundle,
+                oauth2_access_token=oauth2_token
             )
             if imap:
                 print(f"  Connected to {email_config.imap_server}:{email_config.imap_port}")
