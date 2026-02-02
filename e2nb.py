@@ -40,6 +40,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+import hashlib
 import json
 import queue
 import threading
@@ -1053,6 +1054,12 @@ class StatusBadge(tk.Frame):
     def _pulse(self, step: int):
         if not self._pulse_active:
             return
+        # Check if widget still exists to prevent memory leak
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
         if step % 40 < 20:
             self.canvas.itemconfig(self._glow, fill=Theme.SUCCESS_LIGHT)
         else:
@@ -1171,6 +1178,9 @@ class EmailMonitorApp:
         self.auto_scroll_var = tk.BooleanVar(value=True)
         self.show_password_var = tk.BooleanVar(value=False)
 
+        # Track SMTP receiver changes to update email source status
+        self.smtp_recv_var.trace_add("write", lambda *a: self._update_email_source_status())
+
         # Track changes to service toggles
         for var in self._service_vars():
             var.trace_add("write", lambda *a: self._update_services_badge())
@@ -1198,6 +1208,12 @@ class EmailMonitorApp:
         if hasattr(self, '_sources_badge'):
             count = sum(1 for v in self._source_vars() if v.get())
             self._sources_badge.update_count(count, total=4)
+
+    def _update_email_source_status(self):
+        """Update email source status based on credentials and SMTP receiver."""
+        has_creds = bool(hasattr(self, 'username') and self.username.get())
+        has_smtp_recv = self.smtp_recv_var.get()
+        self.email_source_var.set(has_creds or has_smtp_recv)
 
     def _create_layout(self):
         """Create the main layout structure."""
@@ -1228,11 +1244,32 @@ class EmailMonitorApp:
 
         def _on_global_mousewheel(event):
             if self._active_scroll_canvas:
-                self._active_scroll_canvas.yview_scroll(
-                    int(-1 * (event.delta / 120)), "units"
-                )
+                # Handle cross-platform scroll delta differences
+                if sys.platform == "darwin":
+                    # macOS uses smaller delta values
+                    delta = -event.delta
+                elif sys.platform == "win32":
+                    # Windows uses delta/120
+                    delta = int(-event.delta / 120)
+                else:
+                    # Linux: delta is typically 120 or -120
+                    delta = int(-event.delta / 120) if event.delta else 0
+                self._active_scroll_canvas.yview_scroll(delta, "units")
 
+        def _on_linux_scroll_up(event):
+            if self._active_scroll_canvas:
+                self._active_scroll_canvas.yview_scroll(-1, "units")
+
+        def _on_linux_scroll_down(event):
+            if self._active_scroll_canvas:
+                self._active_scroll_canvas.yview_scroll(1, "units")
+
+        # Bind appropriate events based on platform
         self.root.bind_all("<MouseWheel>", _on_global_mousewheel)
+        # Linux uses Button-4 and Button-5 for scroll
+        if sys.platform.startswith("linux"):
+            self.root.bind_all("<Button-4>", _on_linux_scroll_up)
+            self.root.bind_all("<Button-5>", _on_linux_scroll_down)
 
     def _create_sidebar(self):
         """Create the sidebar navigation with scrollable nav area."""
@@ -1593,6 +1630,8 @@ class EmailMonitorApp:
         )
         self.username.pack(fill="x")
         self.username.set(self.config.get('Email', 'username', fallback=''))
+        # Update email source status when username changes
+        self.username.entry.bind("<KeyRelease>", lambda e: self._update_email_source_status())
 
         self._create_separator(section2.content)
 
@@ -2060,6 +2099,12 @@ class EmailMonitorApp:
         toggle_frame.pack(fill="x", pady=(0, 24))
         ToggleSwitch(toggle_frame, "Enable RSS Feed Monitoring", self.rss_var).pack(fill="x")
 
+        # Warn if enabling without feedparser
+        def on_rss_toggle(*args):
+            if self.rss_var.get() and not FEEDPARSER_AVAILABLE:
+                self.toast.show("Warning: feedparser not installed. RSS monitoring will not work.", "error")
+        self.rss_var.trace_add("write", on_rss_toggle)
+
         # Library status
         if not FEEDPARSER_AVAILABLE:
             warning_frame = tk.Frame(page, bg=Theme.WARNING_LIGHT)
@@ -2089,6 +2134,15 @@ class EmailMonitorApp:
         )
         self.rss_max_age.pack(fill="x")
         self.rss_max_age.set(self.config.get('RSS', 'max_age_hours', fallback='24'))
+
+        self._create_separator(section1.content)
+
+        self.rss_max_items = FormRow(
+            section1.content, "Max Items/Check", "Maximum new items per feed (default: 10)",
+            tooltip="Limit how many new items are processed per feed per check",
+        )
+        self.rss_max_items.pack(fill="x")
+        self.rss_max_items.set(self.config.get('RSS', 'max_items_per_check', fallback='10'))
 
         # Feeds list
         section2 = FormSection(page, "RSS Feeds", "Add feeds to monitor (JSON format)")
@@ -2529,6 +2583,7 @@ class EmailMonitorApp:
         self.config['RSS']['enabled'] = str(self.rss_var.get())
         self.config['RSS']['check_interval'] = self.rss_interval.get()
         self.config['RSS']['max_age_hours'] = self.rss_max_age.get()
+        self.config['RSS']['max_items_per_check'] = self.rss_max_items.get()
         self.config['RSS']['feeds'] = self.rss_feeds_text.get("1.0", tk.END).strip()
 
         # Web monitor settings
@@ -2681,18 +2736,18 @@ class EmailMonitorApp:
         self._log(f"Dispatched {success_count}/{len(results)} notifications", "INFO")
 
     def _monitor_loop(self):
-        dispatcher = NotificationDispatcher(self.config)
         monitor_state = MonitorState()
-
-        # Load monitoring source configs
-        rss_config = RssFeedConfig.from_config(self.config)
-        web_config = WebMonitorConfig.from_config(self.config)
-        http_config = HttpEndpointConfig.from_config(self.config)
 
         while not self.stop_event.is_set():
             imap = None
             pop3 = None
             try:
+                # Reload configs each cycle to pick up any changes
+                dispatcher = NotificationDispatcher(self.config)
+                rss_config = RssFeedConfig.from_config(self.config)
+                web_config = WebMonitorConfig.from_config(self.config)
+                http_config = HttpEndpointConfig.from_config(self.config)
+
                 interval = int(self.config.get('Settings', 'check_interval', fallback='60'))
                 filters = [f.strip().lower() for f in self.config.get('Email', 'filter_emails', fallback='').split(',') if f.strip()]
 
@@ -2778,6 +2833,13 @@ class EmailMonitorApp:
                             subject = decode_email_subject(msg)
                             body = extract_email_body(msg)
 
+                            # Create a hash to track this message and avoid duplicates
+                            msg_hash = hashlib.md5(f"{sender}{subject}{body[:500]}".encode()).hexdigest()
+
+                            # Skip if already processed
+                            if monitor_state.is_pop3_message_seen(msg_hash):
+                                continue
+
                             self._log(f"Processing email: {subject[:40]}...", "INFO")
 
                             notification = EmailNotification(
@@ -2796,7 +2858,12 @@ class EmailMonitorApp:
                             )
 
                             if any(r.success for r in results):
+                                # Mark as seen and delete from server
+                                monitor_state.mark_pop3_message_seen(msg_hash)
                                 delete_pop3_message(pop3, msg_num)
+
+                        # Cleanup old tracked messages periodically
+                        monitor_state.cleanup_old_pop3_messages()
                     else:
                         self._log("POP3 connection failed", "WARNING")
 

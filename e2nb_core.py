@@ -1598,8 +1598,12 @@ This notification was sent by E2NB - Email to Notification Blaster.
         msg.attach(MIMEText(html_body, 'html'))
 
         # Connect and send
-        if use_tls and smtp_port == 465:
-            # SSL connection (port 465)
+        # Port 465 uses implicit SSL (SMTP_SSL), port 587 uses STARTTLS
+        # Other ports: use SSL if port ends in 465, otherwise STARTTLS if TLS enabled
+        use_implicit_ssl = smtp_port == 465 or (smtp_port % 1000 == 465)
+
+        if use_implicit_ssl:
+            # SSL connection (port 465 or similar)
             context = ssl.create_default_context()
             with smtplib.SMTP_SSL(smtp_server, smtp_port, context=context, timeout=DEFAULT_TIMEOUT) as server:
                 server.login(username, password)
@@ -1607,9 +1611,11 @@ This notification was sent by E2NB - Email to Notification Blaster.
         else:
             # STARTTLS connection (port 587) or no TLS
             with smtplib.SMTP(smtp_server, smtp_port, timeout=DEFAULT_TIMEOUT) as server:
+                server.ehlo()
                 if use_tls:
                     context = ssl.create_default_context()
                     server.starttls(context=context)
+                    server.ehlo()
                 server.login(username, password)
                 server.sendmail(from_address, to_address, msg.as_string())
 
@@ -1853,8 +1859,11 @@ def test_smtp_connection(config: SmtpConfig) -> Tuple[bool, str]:
         Tuple of (success, message).
     """
     try:
-        if config.use_tls and config.smtp_port == 465:
-            # SSL connection (port 465)
+        # Port 465 uses implicit SSL, other ports use STARTTLS if TLS enabled
+        use_implicit_ssl = config.smtp_port == 465 or (config.smtp_port % 1000 == 465)
+
+        if use_implicit_ssl:
+            # SSL connection (port 465 or similar)
             context = ssl.create_default_context()
             with smtplib.SMTP_SSL(config.smtp_server, config.smtp_port, context=context, timeout=DEFAULT_TIMEOUT) as server:
                 server.login(config.username, config.password)
@@ -1896,6 +1905,7 @@ class MonitorState:
         self.state_file = state_file
         self._state: Dict[str, Any] = {
             'seen_rss_items': {},  # feed_url -> set of item IDs
+            'seen_pop3_messages': set(),  # set of message hashes for POP3
             'web_page_hashes': {},  # page_url -> content hash
             'http_endpoint_status': {},  # endpoint_url -> last status
             'last_updated': None
@@ -1913,6 +1923,9 @@ class MonitorState:
                         loaded['seen_rss_items'] = {
                             k: set(v) for k, v in loaded['seen_rss_items'].items()
                         }
+                    # Convert list back to set for seen_pop3_messages
+                    if 'seen_pop3_messages' in loaded:
+                        loaded['seen_pop3_messages'] = set(loaded['seen_pop3_messages'])
                     self._state.update(loaded)
             except (json.JSONDecodeError, IOError) as e:
                 logger.warning(f"Could not load state file: {e}")
@@ -1926,6 +1939,8 @@ class MonitorState:
                 state_to_save['seen_rss_items'] = {
                     k: list(v) for k, v in state_to_save['seen_rss_items'].items()
                 }
+            if 'seen_pop3_messages' in state_to_save:
+                state_to_save['seen_pop3_messages'] = list(state_to_save['seen_pop3_messages'])
             state_to_save['last_updated'] = datetime.now().isoformat()
 
             # Write to temp file then rename for atomicity
@@ -1946,6 +1961,25 @@ class MonitorState:
         if feed_url not in self._state['seen_rss_items']:
             self._state['seen_rss_items'][feed_url] = set()
         self._state['seen_rss_items'][feed_url].add(item_id)
+
+    def is_pop3_message_seen(self, message_hash: str) -> bool:
+        """Check if a POP3 message has been seen before."""
+        return message_hash in self._state.get('seen_pop3_messages', set())
+
+    def mark_pop3_message_seen(self, message_hash: str):
+        """Mark a POP3 message as seen."""
+        if 'seen_pop3_messages' not in self._state:
+            self._state['seen_pop3_messages'] = set()
+        self._state['seen_pop3_messages'].add(message_hash)
+
+    def cleanup_old_pop3_messages(self, max_items: int = 1000):
+        """Limit stored POP3 message hashes to prevent unbounded growth."""
+        if 'seen_pop3_messages' in self._state:
+            items = self._state['seen_pop3_messages']
+            if len(items) > max_items:
+                # Convert to list, keep recent items, convert back to set
+                items_list = list(items)
+                self._state['seen_pop3_messages'] = set(items_list[-max_items:])
 
     def get_web_page_hash(self, url: str) -> Optional[str]:
         """Get stored hash for a web page."""
@@ -2671,6 +2705,7 @@ def test_smtp_receiver_port(host: str, port: int) -> Tuple[bool, str]:
     import socket
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.settimeout(2)
         sock.bind((host, port))
         sock.close()
