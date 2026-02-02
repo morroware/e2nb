@@ -141,18 +141,30 @@ class EmailMonitorDaemon:
             )
             return False
 
-        # Check email settings - IMAP is required unless SMTP receiver is enabled
+        # Check email settings - email source is required unless SMTP receiver or
+        # other monitoring sources (RSS, Web, HTTP) are enabled
         smtp_receiver_enabled = self.config.getboolean('SmtpReceiver', 'enabled', fallback=False)
-        if not smtp_receiver_enabled:
+        rss_enabled = self.config.getboolean('RSS', 'enabled', fallback=False)
+        web_enabled = self.config.getboolean('WebMonitor', 'enabled', fallback=False)
+        http_enabled = self.config.getboolean('HttpMonitor', 'enabled', fallback=False)
+        has_other_sources = smtp_receiver_enabled or rss_enabled or web_enabled or http_enabled
+
+        if not has_other_sources:
             email_section = self.config['Email'] if 'Email' in self.config else {}
-            required_fields = ['imap_server', 'imap_port', 'username', 'password']
+            protocol = email_section.get('protocol', 'imap').lower()
+
+            # Validate based on selected protocol
+            if protocol == 'pop3':
+                required_fields = ['pop3_server', 'pop3_port', 'username', 'password']
+            else:
+                required_fields = ['imap_server', 'imap_port', 'username', 'password']
 
             for field in required_fields:
                 if not email_section.get(field):
                     logging.error(
                         f"Missing required email configuration: {field}. "
                         "Please check config.ini. "
-                        "(Or enable SmtpReceiver as an alternative to IMAP.)"
+                        "(Or enable SmtpReceiver/RSS/Web/HTTP monitoring as an alternative.)"
                     )
                     return False
 

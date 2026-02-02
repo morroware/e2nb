@@ -2725,8 +2725,11 @@ class EmailMonitorApp:
             return False
         has_email_creds = bool(self.username.get() and self.password.get())
         has_smtp_recv = self.smtp_recv_var.get()
-        if not has_email_creds and not has_smtp_recv:
-            self.toast.show("Configure email credentials or enable SMTP Receiver.", "error")
+        has_rss = self.rss_var.get()
+        has_web = self.webmon_var.get()
+        has_http = self.httpmon_var.get()
+        if not has_email_creds and not has_smtp_recv and not has_rss and not has_web and not has_http:
+            self.toast.show("Configure at least one source: email, SMTP receiver, RSS, web, or HTTP.", "error")
             return False
         return True
 
@@ -2821,6 +2824,7 @@ class EmailMonitorApp:
         while not self.stop_event.is_set():
             imap = None
             pop3 = None
+            dispatcher = None
             try:
                 # Reload configs each cycle to pick up any changes
                 dispatcher = NotificationDispatcher(self.config)
@@ -3038,6 +3042,11 @@ class EmailMonitorApp:
                 if pop3:
                     try:
                         pop3.quit()
+                    except Exception:
+                        pass
+                if dispatcher:
+                    try:
+                        dispatcher.close()
                     except Exception:
                         pass
 
