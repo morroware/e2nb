@@ -534,8 +534,12 @@ class MonitorEvent:
 
     def to_email_notification(self) -> 'EmailNotification':
         """Convert to EmailNotification for backward compatibility."""
+        raw_id = self.metadata.get('id', b'0')
+        # Ensure email_id is always bytes
+        if isinstance(raw_id, str):
+            raw_id = raw_id.encode('utf-8')
         return EmailNotification(
-            email_id=self.metadata.get('id', b'0'),
+            email_id=raw_id,
             sender=self.source_name,
             subject=f"[{self.source_type.upper()}] {self.title}",
             body=self.body,
@@ -1156,7 +1160,7 @@ def fetch_unread_emails(
 
         emails = []
         for email_id in email_ids:
-            res, msg_data = imap.fetch(email_id, "(RFC822)")
+            res, msg_data = imap.fetch(email_id, "(BODY.PEEK[])")
             for response in msg_data:
                 if isinstance(response, tuple):
                     msg = email_module.message_from_bytes(response[1])
@@ -1220,7 +1224,7 @@ def fetch_unread_emails_by_uid(
 
         for uid in uids:
             try:
-                res, msg_data = imap.uid('fetch', str(uid), '(RFC822)')
+                res, msg_data = imap.uid('fetch', str(uid), '(BODY.PEEK[])')
                 for response in msg_data:
                     if isinstance(response, tuple):
                         msg = email_module.message_from_bytes(response[1])
@@ -1834,7 +1838,7 @@ def send_telegram_message(
             if use_markdown_v2:
                 logger.warning("MarkdownV2 failed, retrying with plain text")
                 return send_telegram_message(
-                    bot_token, chat_id, subject, body, session, use_markdown_v2=False
+                    bot_token, chat_id, subject, body, http_session, use_markdown_v2=False
                 )
             error_msg = f"HTTP {response.status_code}: {response.text}"
             logger.error(f"Failed to send Telegram message: {error_msg}")
@@ -1910,61 +1914,47 @@ def send_custom_webhook(
     if not validate_url(webhook_url):
         return NotificationResult(False, "Webhook", "Invalid webhook URL")
 
-    # Create session with retry capability for POST if enabled
-    if retry_on_post and session is None:
+    # Use a session with POST retry built into urllib3 if no session provided.
+    # This avoids the need for a manual retry loop.
+    if session is None:
+        retry_methods = ["HEAD", "GET", "OPTIONS"]
+        if retry_on_post:
+            retry_methods.append("POST")
         retry_strategy = Retry(
             total=max_retries,
             backoff_factor=RETRY_BACKOFF_FACTOR,
             status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]  # Include POST
+            allowed_methods=retry_methods,
         )
         http_session = requests.Session()
         adapter = HTTPAdapter(max_retries=retry_strategy)
         http_session.mount("https://", adapter)
         http_session.mount("http://", adapter)
     else:
-        http_session = session or create_http_session()
+        http_session = session
 
-    last_error = ""
-    for attempt in range(max_retries + 1):
-        try:
-            response = http_session.post(webhook_url, json=payload, timeout=DEFAULT_TIMEOUT)
+    try:
+        response = http_session.post(webhook_url, json=payload, timeout=DEFAULT_TIMEOUT)
 
-            if response.status_code in [200, 201, 202, 204]:
-                logger.info("Sent custom webhook")
-                return NotificationResult(True, "Webhook", "Payload delivered")
-            elif response.status_code in [429, 500, 502, 503, 504] and attempt < max_retries:
-                # Retryable error
-                wait_time = (2 ** attempt) * RETRY_BACKOFF_FACTOR
-                logger.warning(f"Webhook returned {response.status_code}, retrying in {wait_time}s...")
-                time.sleep(wait_time)
-                last_error = f"HTTP {response.status_code}"
-                continue
-            else:
-                last_error = f"HTTP {response.status_code}: {response.text[:200]}"
-                logger.error(f"Failed to send custom webhook: {last_error}")
-                return NotificationResult(False, "Webhook", last_error)
+        if response.status_code in [200, 201, 202, 204]:
+            logger.info("Sent custom webhook")
+            return NotificationResult(True, "Webhook", "Payload delivered")
+        else:
+            error_msg = f"HTTP {response.status_code}: {response.text[:200]}"
+            logger.error(f"Failed to send custom webhook: {error_msg}")
+            return NotificationResult(False, "Webhook", error_msg)
 
-        except requests.exceptions.Timeout:
-            last_error = "Request timed out"
-            if attempt < max_retries:
-                wait_time = (2 ** attempt) * RETRY_BACKOFF_FACTOR
-                logger.warning(f"Webhook timed out, retrying in {wait_time}s...")
-                time.sleep(wait_time)
-                continue
-        except requests.exceptions.ConnectionError as e:
-            last_error = f"Connection error: {e}"
-            if attempt < max_retries:
-                wait_time = (2 ** attempt) * RETRY_BACKOFF_FACTOR
-                logger.warning(f"Webhook connection error, retrying in {wait_time}s...")
-                time.sleep(wait_time)
-                continue
-        except Exception as e:
-            last_error = str(e)
-            logger.error(f"Failed to send custom webhook: {e}")
-            break
-
-    return NotificationResult(False, "Webhook", last_error)
+    except requests.exceptions.Timeout:
+        last_error = "Request timed out"
+        logger.error(f"Failed to send custom webhook: {last_error}")
+        return NotificationResult(False, "Webhook", last_error)
+    except requests.exceptions.ConnectionError as e:
+        last_error = f"Connection error: {e}"
+        logger.error(f"Failed to send custom webhook: {last_error}")
+        return NotificationResult(False, "Webhook", last_error)
+    except Exception as e:
+        logger.error(f"Failed to send custom webhook: {e}")
+        return NotificationResult(False, "Webhook", str(e))
 
 
 def send_email_notification(
@@ -2427,13 +2417,23 @@ class MonitorState:
                 with open(self.state_file, 'r') as f:
                     loaded = json.load(f)
                     # Convert lists back to sets for seen_rss_items
-                    if 'seen_rss_items' in loaded:
+                    if 'seen_rss_items' in loaded and isinstance(loaded['seen_rss_items'], dict):
                         loaded['seen_rss_items'] = {
-                            k: set(v) for k, v in loaded['seen_rss_items'].items()
+                            k: set(v) if isinstance(v, list) else set()
+                            for k, v in loaded['seen_rss_items'].items()
                         }
+                    else:
+                        loaded.pop('seen_rss_items', None)
                     # Convert list back to set for seen_pop3_messages
                     if 'seen_pop3_messages' in loaded:
-                        loaded['seen_pop3_messages'] = set(loaded['seen_pop3_messages'])
+                        if isinstance(loaded['seen_pop3_messages'], list):
+                            loaded['seen_pop3_messages'] = set(loaded['seen_pop3_messages'])
+                        else:
+                            loaded.pop('seen_pop3_messages', None)
+                    # Ensure dict fields stay as dicts
+                    for key in ('imap_last_uid', 'web_page_hashes', 'http_endpoint_status'):
+                        if key in loaded and not isinstance(loaded[key], dict):
+                            loaded.pop(key, None)
                     self._state.update(loaded)
             except (json.JSONDecodeError, IOError) as e:
                 logger.warning(f"Could not load state file: {e}")
