@@ -88,6 +88,10 @@ from e2nb_core import (
     DEFAULT_MAX_SMS_LENGTH,
     DEFAULT_IMAP_PORT,
     DEFAULT_POP3_PORT,
+    DEFAULT_CONNECTION_TIMEOUT,
+    TLS_MODE_IMPLICIT,
+    TLS_MODE_EXPLICIT,
+    TLS_MODE_NONE,
     FEEDPARSER_AVAILABLE,
     BS4_AVAILABLE,
     AIOSMTPD_AVAILABLE,
@@ -1663,6 +1667,71 @@ class EmailMonitorApp:
         self.filters.pack(fill="x")
         self.filters.set(self.config.get('Email', 'filter_emails', fallback=''))
 
+        # Advanced Settings section
+        adv_section = FormSection(page, "Advanced Settings", "TLS mode, timeouts, and fetch limits")
+        adv_section.pack(fill="x", pady=(24, 0))
+
+        # TLS Mode
+        tls_frame = tk.Frame(adv_section.content, bg=Theme.BG_PRIMARY)
+        tls_frame.pack(fill="x", padx=16, pady=12)
+
+        tk.Label(
+            tls_frame, text="TLS Mode", bg=Theme.BG_PRIMARY,
+            fg=Theme.TEXT_PRIMARY, font=(Theme.FONT, 10),
+        ).pack(side="left")
+
+        self.tls_mode_var = tk.StringVar(
+            value=self.config.get('Email', 'tls_mode', fallback='implicit')
+        )
+        tls_options = [
+            ("implicit", "Implicit SSL (port 993/995)"),
+            ("explicit", "STARTTLS (port 143/110)"),
+            ("none", "No encryption"),
+        ]
+        for i, (value, label) in enumerate(tls_options):
+            tk.Radiobutton(
+                tls_frame, text=label, variable=self.tls_mode_var, value=value,
+                bg=Theme.BG_PRIMARY, fg=Theme.TEXT_PRIMARY,
+                selectcolor=Theme.BG_PRIMARY,
+                activebackground=Theme.BG_PRIMARY, activeforeground=Theme.TEXT_PRIMARY,
+                font=(Theme.FONT, 9),
+            ).pack(side="left", padx=(20 if i == 0 else 10, 0))
+
+        self._create_separator(adv_section.content)
+
+        # Verify SSL checkbox
+        ssl_frame = tk.Frame(adv_section.content, bg=Theme.BG_PRIMARY)
+        ssl_frame.pack(fill="x", padx=16, pady=8)
+        self.verify_ssl_var = tk.BooleanVar(
+            value=self.config.getboolean('Email', 'verify_ssl', fallback=True)
+        )
+        tk.Checkbutton(
+            ssl_frame, text="Verify SSL certificates", variable=self.verify_ssl_var,
+            bg=Theme.BG_PRIMARY, fg=Theme.TEXT_PRIMARY,
+            selectcolor=Theme.BG_PRIMARY, activebackground=Theme.BG_PRIMARY,
+            font=(Theme.FONT, 10),
+        ).pack(anchor="w")
+
+        self._create_separator(adv_section.content)
+
+        # Max emails per check
+        self.max_emails = FormRow(
+            adv_section.content, "Max Emails/Check", "Maximum emails to process per cycle (default: 5)",
+            tooltip="Limit how many emails are processed each monitoring cycle",
+        )
+        self.max_emails.pack(fill="x")
+        self.max_emails.set(self.config.get('Email', 'max_emails_per_check', fallback='5'))
+
+        self._create_separator(adv_section.content)
+
+        # Connection timeout
+        self.conn_timeout = FormRow(
+            adv_section.content, "Timeout (seconds)", "Connection timeout (default: 30)",
+            tooltip="How long to wait for server response",
+        )
+        self.conn_timeout.pack(fill="x")
+        self.conn_timeout.set(self.config.get('Email', 'connection_timeout', fallback='30'))
+
         # SMTP Receiver section
         section4 = FormSection(
             page, "SMTP Receiver (Alternative to IMAP)",
@@ -2516,6 +2585,10 @@ class EmailMonitorApp:
         self.config['Email']['username'] = self.username.get()
         self.config['Email']['password'] = self.password.get()
         self.config['Email']['filter_emails'] = self.filters.get()
+        self.config['Email']['tls_mode'] = self.tls_mode_var.get()
+        self.config['Email']['verify_ssl'] = str(self.verify_ssl_var.get())
+        self.config['Email']['max_emails_per_check'] = self.max_emails.get()
+        self.config['Email']['connection_timeout'] = self.conn_timeout.get()
 
         self.config['Settings']['check_interval'] = self.check_interval.get()
         self.config['Settings']['max_sms_length'] = self.max_sms.get()
@@ -2761,6 +2834,10 @@ class EmailMonitorApp:
                 # =====================================================
                 email_username = self.config.get('Email', 'username', fallback='')
                 protocol = self.config.get('Email', 'protocol', fallback='imap').lower()
+                tls_mode = self.config.get('Email', 'tls_mode', fallback=TLS_MODE_IMPLICIT)
+                verify_ssl = self.config.getboolean('Email', 'verify_ssl', fallback=True)
+                conn_timeout = int(self.config.get('Email', 'connection_timeout', fallback=str(DEFAULT_CONNECTION_TIMEOUT)))
+                max_emails = int(self.config.get('Email', 'max_emails_per_check', fallback='5'))
                 pop3 = None
 
                 if email_username and protocol == 'imap':
@@ -2768,11 +2845,14 @@ class EmailMonitorApp:
                         self.config.get('Email', 'imap_server'),
                         int(self.config.get('Email', 'imap_port', fallback='993')),
                         email_username,
-                        self.config.get('Email', 'password')
+                        self.config.get('Email', 'password'),
+                        timeout=conn_timeout,
+                        tls_mode=tls_mode,
+                        verify_ssl=verify_ssl,
                     )
 
                     if imap:
-                        emails = fetch_unread_emails(imap)
+                        emails = fetch_unread_emails(imap, max_emails=max_emails)
                         if emails:
                             self._log(f"Found {len(emails)} unread email(s)", "INFO")
 
@@ -2814,11 +2894,14 @@ class EmailMonitorApp:
                         self.config.get('Email', 'pop3_server'),
                         int(self.config.get('Email', 'pop3_port', fallback='995')),
                         email_username,
-                        self.config.get('Email', 'password')
+                        self.config.get('Email', 'password'),
+                        timeout=conn_timeout,
+                        tls_mode=tls_mode,
+                        verify_ssl=verify_ssl,
                     )
 
                     if pop3:
-                        pop3_emails = fetch_pop3_emails(pop3)
+                        pop3_emails = fetch_pop3_emails(pop3, max_emails=max_emails)
                         if pop3_emails:
                             self._log(f"Found {len(pop3_emails)} email(s) via POP3", "INFO")
 

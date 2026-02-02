@@ -14,6 +14,7 @@ Version: 1.0.0
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import signal
 import sys
@@ -335,14 +336,31 @@ class EmailMonitorDaemon:
                                 continue
                             subject = decode_email_subject(msg)
                             body = extract_email_body(msg)
+
+                            # Create hash to track this message and avoid duplicates
+                            msg_hash = hashlib.md5(
+                                f"{sender}{subject}{body[:500]}".encode()
+                            ).hexdigest()
+
+                            # Skip if already processed
+                            if monitor_state.is_pop3_message_seen(msg_hash):
+                                continue
+
                             notification = EmailNotification(
                                 email_id=str(msg_num).encode(),
                                 sender=sender,
                                 subject=subject,
                                 body=body
                             )
-                            self._dispatch_notification(notification)
-                            delete_pop3_message(pop3, msg_num)
+
+                            # Dispatch and only delete/mark seen on success
+                            success = self._dispatch_notification(notification)
+                            if success:
+                                monitor_state.mark_pop3_message_seen(msg_hash)
+                                delete_pop3_message(pop3, msg_num)
+
+                        # Cleanup old tracked messages
+                        monitor_state.cleanup_old_pop3_messages()
                     else:
                         logging.warning("Failed to connect to POP3 server")
 
@@ -413,18 +431,22 @@ class EmailMonitorDaemon:
                     logging.debug(f"Sleeping for {check_interval} seconds")
                     self.stop_event.wait(check_interval)
 
-    def _dispatch_notification(self, notification: EmailNotification):
+    def _dispatch_notification(self, notification: EmailNotification) -> bool:
         """
         Dispatch a notification to all enabled channels.
 
         Args:
             notification: The notification to dispatch.
+
+        Returns:
+            True if at least one notification was sent successfully.
         """
         results = self.dispatcher.dispatch(notification, callback=self._on_notification_result)
         success_count = sum(1 for r in results if r.success)
         failure_count = len(results) - success_count
         if results:
             logging.info(f"Notifications sent: {success_count} success, {failure_count} failed")
+        return success_count > 0
 
     def _process_email(self, imap, email_id: bytes, msg, filter_emails: list):
         """
