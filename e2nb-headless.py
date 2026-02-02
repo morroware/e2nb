@@ -91,6 +91,9 @@ class EmailMonitorDaemon:
         """
         Load and validate configuration.
 
+        Validates the new configuration fully before swapping it in.
+        If validation fails, the existing config/dispatcher remain active.
+
         Returns:
             True if configuration is valid, False otherwise.
         """
@@ -98,11 +101,18 @@ class EmailMonitorDaemon:
             new_config = load_config(self.config_file)
             new_dispatcher = NotificationDispatcher(new_config)
 
-            # Validate new configuration before swapping
-            old_dispatcher = self.dispatcher
-            old_config = self.config
+            # Validate new configuration BEFORE swapping
+            if not self._validate_configuration(new_config, new_dispatcher):
+                # Validation failed - close the new dispatcher and keep existing config
+                try:
+                    new_dispatcher.close()
+                except Exception:
+                    pass
+                logging.error("New configuration failed validation; keeping existing configuration.")
+                return False
 
-            # Atomically swap configuration (thread-safe)
+            # Validation passed - atomically swap configuration (thread-safe)
+            old_dispatcher = self.dispatcher
             with self._config_lock:
                 self.config = new_config
                 self.dispatcher = new_dispatcher
@@ -114,10 +124,6 @@ class EmailMonitorDaemon:
                 except Exception as e:
                     logging.debug(f"Error closing old dispatcher: {e}")
 
-            # Validate configuration
-            if not self._validate_configuration():
-                return False
-
             return True
         except ConfigurationError as e:
             logging.error(f"Configuration error: {e}")
@@ -126,15 +132,22 @@ class EmailMonitorDaemon:
             logging.error(f"Failed to load configuration: {e}")
             return False
 
-    def _validate_configuration(self) -> bool:
+    def _validate_configuration(self, config=None, dispatcher=None) -> bool:
         """
-        Validate the loaded configuration.
+        Validate a configuration.
+
+        Args:
+            config: Config to validate (defaults to self.config for backward compat).
+            dispatcher: Dispatcher to validate (defaults to self.dispatcher).
 
         Returns:
             True if configuration is valid, False otherwise.
         """
+        config = config or self.config
+        dispatcher = dispatcher or self.dispatcher
+
         # Check notification methods
-        if not self.dispatcher.has_any_enabled():
+        if not dispatcher.has_any_enabled():
             logging.error(
                 "No notification methods enabled. "
                 "Please enable at least one method in config.ini."
@@ -143,14 +156,14 @@ class EmailMonitorDaemon:
 
         # Check email settings - email source is required unless SMTP receiver or
         # other monitoring sources (RSS, Web, HTTP) are enabled
-        smtp_receiver_enabled = self.config.getboolean('SmtpReceiver', 'enabled', fallback=False)
-        rss_enabled = self.config.getboolean('RSS', 'enabled', fallback=False)
-        web_enabled = self.config.getboolean('WebMonitor', 'enabled', fallback=False)
-        http_enabled = self.config.getboolean('HttpMonitor', 'enabled', fallback=False)
+        smtp_receiver_enabled = config.getboolean('SmtpReceiver', 'enabled', fallback=False)
+        rss_enabled = config.getboolean('RSS', 'enabled', fallback=False)
+        web_enabled = config.getboolean('WebMonitor', 'enabled', fallback=False)
+        http_enabled = config.getboolean('HttpMonitor', 'enabled', fallback=False)
         has_other_sources = smtp_receiver_enabled or rss_enabled or web_enabled or http_enabled
 
         if not has_other_sources:
-            email_section = self.config['Email'] if 'Email' in self.config else {}
+            email_section = config['Email'] if 'Email' in config else {}
             protocol = email_section.get('protocol', 'imap').lower()
 
             # Validate based on selected protocol
@@ -169,7 +182,7 @@ class EmailMonitorDaemon:
                     return False
 
         # Validate check interval
-        raw_interval = self.config.get('Settings', 'check_interval', fallback=str(DEFAULT_CHECK_INTERVAL))
+        raw_interval = config.get('Settings', 'check_interval', fallback=str(DEFAULT_CHECK_INTERVAL))
         check_interval = safe_int(raw_interval, DEFAULT_CHECK_INTERVAL, min_val=10, max_val=86400)
         try:
             if check_interval != int(raw_interval):

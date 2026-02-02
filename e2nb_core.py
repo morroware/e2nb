@@ -2792,6 +2792,15 @@ def fetch_web_page(
         content = response.text
 
         # Extract specific content if selector provided
+        if css_selector and not BS4_AVAILABLE:
+            logger.warning(
+                f"CSS selector '{css_selector}' configured for {url} but beautifulsoup4 is not installed. "
+                "Install it with: pip install beautifulsoup4. Skipping this page."
+            )
+            return False, "", (
+                f"CSS selector '{css_selector}' requires beautifulsoup4. "
+                "Install with: pip install beautifulsoup4"
+            )
         if css_selector and BS4_AVAILABLE:
             try:
                 soup = BeautifulSoup(content, 'html.parser')
@@ -2847,10 +2856,13 @@ def check_web_pages(
 
         success, content, error = fetch_web_page(url, css_selector, session)
 
+        # Use web: prefix to avoid key collision with HTTP endpoint monitor
+        state_key = f"web:{url}"
+
         if not success:
             if notify_on_error:
                 # Check if this is a new error (status changed from OK)
-                last_status = state.get_http_status(url)
+                last_status = state.get_http_status(state_key)
                 if last_status and last_status.get('ok', True):
                     event = MonitorEvent(
                         source_type='web',
@@ -2863,7 +2875,7 @@ def check_web_pages(
                     )
                     events.append(event)
                     logger.warning(f"Web page '{name}' error: {error}")
-            state.set_http_status(url, {'ok': False, 'error': error})
+            state.set_http_status(state_key, {'ok': False, 'error': error})
             continue
 
         # Compute hash of content
@@ -2873,7 +2885,7 @@ def check_web_pages(
         if previous_hash is None:
             # First time seeing this page, store hash but don't notify
             state.set_web_page_hash(url, content_hash)
-            state.set_http_status(url, {'ok': True})
+            state.set_http_status(state_key, {'ok': True})
             logger.info(f"Web page '{name}' - initial hash stored")
             continue
 
@@ -2896,7 +2908,7 @@ def check_web_pages(
             state.set_web_page_hash(url, content_hash)
             logger.info(f"Web page '{name}' changed")
 
-        state.set_http_status(url, {'ok': True})
+        state.set_http_status(state_key, {'ok': True})
 
     return events
 
@@ -3192,7 +3204,16 @@ class SmtpReceiver:
                 kwargs['authenticator'] = _SmtpAuthenticator(
                     self._config.username, self._config.password
                 )
+                # aiosmtpd requires auth_require_tls=False when no TLS context is provided.
+                # Since this receiver doesn't configure TLS, we must disable the requirement.
+                # Log a security warning for non-local bindings.
                 kwargs['auth_require_tls'] = False
+                if self._config.host not in ('127.0.0.1', 'localhost', '::1'):
+                    logger.warning(
+                        "SMTP receiver auth is enabled without TLS. "
+                        "Credentials will be transmitted in plaintext. "
+                        "For production use, bind to 127.0.0.1 or place behind a TLS proxy."
+                    )
 
             self._controller = SmtpdController(**kwargs)
             self._controller.start()
