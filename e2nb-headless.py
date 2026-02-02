@@ -169,6 +169,8 @@ class EmailMonitorDaemon:
             enabled_methods.append('Discord')
         if self.config.getboolean('CustomWebhook', 'enabled', fallback=False):
             enabled_methods.append('Webhook')
+        if self.config.getboolean('SMTP', 'enabled', fallback=False):
+            enabled_methods.append('Email (SMTP)')
 
         logging.info(f"Enabled notification methods: {', '.join(enabled_methods)}")
 
@@ -495,6 +497,7 @@ def test_configuration(config_file: str) -> bool:
         ('Telegram', 'Telegram', 'enabled'),
         ('Discord', 'Discord', 'enabled'),
         ('Custom Webhook', 'CustomWebhook', 'enabled'),
+        ('Email (SMTP)', 'SMTP', 'enabled'),
     ]
 
     for name, section, key in methods:

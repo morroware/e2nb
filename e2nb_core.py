@@ -18,12 +18,16 @@ import imaplib
 import logging
 import os
 import re
+import smtplib
+import ssl
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from email.header import decode_header
 from email.message import Message
-from email.utils import parseaddr
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import parseaddr, formataddr
 from html import escape as html_escape
 from typing import Any, Callable, List, Optional, Tuple, Dict
 from urllib.parse import urlparse
@@ -225,6 +229,40 @@ class WebhookConfig:
         return cls(
             enabled=section.getboolean('enabled', fallback=False),
             webhook_url=section.get('webhook_url', '')
+        )
+
+
+@dataclass
+class SmtpConfig:
+    """SMTP email notification configuration."""
+    enabled: bool = False
+    smtp_server: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    use_tls: bool = True
+    username: str = ""
+    password: str = ""
+    from_address: str = ""
+    to_addresses: List[str] = field(default_factory=list)
+    subject_prefix: str = "[E2NB]"
+
+    @classmethod
+    def from_config(cls, config: configparser.ConfigParser) -> 'SmtpConfig':
+        """Create SmtpConfig from ConfigParser."""
+        if 'SMTP' not in config:
+            return cls()
+        section = config['SMTP']
+        to_str = section.get('to_addresses', '')
+        to_addresses = [addr.strip() for addr in to_str.split(',') if addr.strip()]
+        return cls(
+            enabled=section.getboolean('enabled', fallback=False),
+            smtp_server=section.get('smtp_server', 'smtp.gmail.com'),
+            smtp_port=int(section.get('smtp_port', '587')),
+            use_tls=section.getboolean('use_tls', fallback=True),
+            username=section.get('username', ''),
+            password=section.get('password', ''),
+            from_address=section.get('from_address', ''),
+            to_addresses=to_addresses,
+            subject_prefix=section.get('subject_prefix', '[E2NB]')
         )
 
 
@@ -506,6 +544,18 @@ def create_default_config(config_file: str = CONFIG_FILE_PATH) -> None:
     config['CustomWebhook'] = {
         'enabled': 'False',
         'webhook_url': ''
+    }
+
+    config['SMTP'] = {
+        'enabled': 'False',
+        'smtp_server': 'smtp.gmail.com',
+        'smtp_port': '587',
+        'use_tls': 'True',
+        'username': '',
+        'password': '',
+        'from_address': '',
+        'to_addresses': '',
+        'subject_prefix': '[E2NB]'
     }
 
     with open(config_file, 'w') as file:
@@ -1080,6 +1130,133 @@ def send_custom_webhook(
         return NotificationResult(False, "Webhook", str(e))
 
 
+def send_email_notification(
+    smtp_server: str,
+    smtp_port: int,
+    username: str,
+    password: str,
+    from_address: str,
+    to_address: str,
+    subject: str,
+    body: str,
+    sender_email: str,
+    use_tls: bool = True,
+    subject_prefix: str = "[E2NB]"
+) -> NotificationResult:
+    """
+    Send an email notification via SMTP.
+
+    Args:
+        smtp_server: SMTP server hostname.
+        smtp_port: SMTP server port.
+        username: SMTP authentication username.
+        password: SMTP authentication password.
+        from_address: Sender email address.
+        to_address: Recipient email address.
+        subject: Original email subject.
+        body: Original email body.
+        sender_email: Original sender's email address.
+        use_tls: Whether to use TLS encryption.
+        subject_prefix: Prefix to add to subject line.
+
+    Returns:
+        NotificationResult with success status.
+    """
+    if not validate_email(to_address):
+        return NotificationResult(False, "Email", f"Invalid recipient address: {to_address}")
+
+    if not validate_email(from_address):
+        return NotificationResult(False, "Email", f"Invalid sender address: {from_address}")
+
+    try:
+        # Create message
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = f"{subject_prefix} {subject}"
+        msg['From'] = formataddr(("E2NB Notification", from_address))
+        msg['To'] = to_address
+
+        # Plain text version
+        text_body = f"""E2NB Email Notification
+{'=' * 40}
+
+From: {sender_email}
+Subject: {subject}
+
+{'=' * 40}
+{body}
+{'=' * 40}
+
+This notification was sent by E2NB - Email to Notification Blaster.
+"""
+
+        # HTML version
+        html_body = f"""<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #333; }}
+        .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+        .header {{ background: #3b82f6; color: white; padding: 20px; border-radius: 8px 8px 0 0; }}
+        .header h1 {{ margin: 0; font-size: 18px; }}
+        .content {{ background: #f8fafc; padding: 20px; border: 1px solid #e2e8f0; }}
+        .meta {{ background: #fff; padding: 12px; border-radius: 4px; margin-bottom: 16px; border-left: 4px solid #3b82f6; }}
+        .meta strong {{ color: #1e40af; }}
+        .body {{ background: #fff; padding: 16px; border-radius: 4px; white-space: pre-wrap; font-family: monospace; font-size: 13px; }}
+        .footer {{ background: #f1f5f9; padding: 12px; text-align: center; font-size: 12px; color: #64748b; border-radius: 0 0 8px 8px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>E2NB Email Notification</h1>
+        </div>
+        <div class="content">
+            <div class="meta">
+                <strong>From:</strong> {html_escape(sender_email)}<br>
+                <strong>Subject:</strong> {html_escape(subject)}
+            </div>
+            <div class="body">{html_escape(body)}</div>
+        </div>
+        <div class="footer">
+            Sent by E2NB - Email to Notification Blaster
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+        msg.attach(MIMEText(text_body, 'plain'))
+        msg.attach(MIMEText(html_body, 'html'))
+
+        # Connect and send
+        if use_tls and smtp_port == 465:
+            # SSL connection (port 465)
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(smtp_server, smtp_port, context=context, timeout=DEFAULT_TIMEOUT) as server:
+                server.login(username, password)
+                server.sendmail(from_address, to_address, msg.as_string())
+        else:
+            # STARTTLS connection (port 587) or no TLS
+            with smtplib.SMTP(smtp_server, smtp_port, timeout=DEFAULT_TIMEOUT) as server:
+                if use_tls:
+                    context = ssl.create_default_context()
+                    server.starttls(context=context)
+                server.login(username, password)
+                server.sendmail(from_address, to_address, msg.as_string())
+
+        logger.info(f"Sent email notification to {to_address}")
+        return NotificationResult(True, "Email", f"Sent to {to_address}")
+    except smtplib.SMTPAuthenticationError as e:
+        logger.error(f"SMTP authentication failed: {e}")
+        return NotificationResult(False, "Email", "Authentication failed")
+    except smtplib.SMTPException as e:
+        logger.error(f"SMTP error sending to {to_address}: {e}")
+        return NotificationResult(False, "Email", str(e))
+    except Exception as e:
+        logger.error(f"Failed to send email notification to {to_address}: {e}")
+        return NotificationResult(False, "Email", str(e))
+
+
 # =============================================================================
 # Email Processing
 # =============================================================================
@@ -1118,6 +1295,7 @@ class NotificationDispatcher:
         self.telegram = TelegramConfig.from_config(config)
         self.discord = DiscordConfig.from_config(config)
         self.webhook = WebhookConfig.from_config(config)
+        self.smtp = SmtpConfig.from_config(config)
         self.http_session = create_http_session()
 
     def has_any_enabled(self) -> bool:
@@ -1129,7 +1307,8 @@ class NotificationDispatcher:
             self.slack.enabled,
             self.telegram.enabled,
             self.discord.enabled,
-            self.webhook.enabled
+            self.webhook.enabled,
+            self.smtp.enabled
         ])
 
     def dispatch(
@@ -1246,6 +1425,26 @@ class NotificationDispatcher:
             if callback:
                 callback(result)
 
+        # SMTP Email
+        if self.smtp.enabled:
+            for to_address in self.smtp.to_addresses:
+                result = send_email_notification(
+                    self.smtp.smtp_server,
+                    self.smtp.smtp_port,
+                    self.smtp.username,
+                    self.smtp.password,
+                    self.smtp.from_address,
+                    to_address,
+                    notification.subject,
+                    notification.body,
+                    notification.sender,
+                    self.smtp.use_tls,
+                    self.smtp.subject_prefix
+                )
+                results.append(result)
+                if callback:
+                    callback(result)
+
         return results
 
 
@@ -1270,5 +1469,43 @@ def test_imap_connection(config: EmailConfig) -> Tuple[bool, str]:
             imap.logout()
             return True, f"Successfully connected to {config.imap_server}"
         return False, "Connection failed - check credentials"
+    except Exception as e:
+        return False, str(e)
+
+
+def test_smtp_connection(config: SmtpConfig) -> Tuple[bool, str]:
+    """
+    Test SMTP connection with provided configuration.
+
+    Args:
+        config: SMTP configuration to test.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    try:
+        if config.use_tls and config.smtp_port == 465:
+            # SSL connection (port 465)
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(config.smtp_server, config.smtp_port, context=context, timeout=DEFAULT_TIMEOUT) as server:
+                server.login(config.username, config.password)
+                return True, f"Successfully connected to {config.smtp_server}:{config.smtp_port} (SSL)"
+        else:
+            # STARTTLS connection (port 587) or no TLS
+            with smtplib.SMTP(config.smtp_server, config.smtp_port, timeout=DEFAULT_TIMEOUT) as server:
+                server.ehlo()
+                if config.use_tls:
+                    context = ssl.create_default_context()
+                    server.starttls(context=context)
+                    server.ehlo()
+                server.login(config.username, config.password)
+                tls_status = "TLS" if config.use_tls else "no TLS"
+                return True, f"Successfully connected to {config.smtp_server}:{config.smtp_port} ({tls_status})"
+    except smtplib.SMTPAuthenticationError:
+        return False, "Authentication failed - check username and password"
+    except smtplib.SMTPConnectError:
+        return False, f"Could not connect to {config.smtp_server}:{config.smtp_port}"
+    except TimeoutError:
+        return False, f"Connection to {config.smtp_server}:{config.smtp_port} timed out"
     except Exception as e:
         return False, str(e)

@@ -62,7 +62,9 @@ from e2nb_core import (
     EmailNotification,
     NotificationDispatcher,
     EmailConfig,
+    SmtpConfig,
     test_imap_connection,
+    test_smtp_connection,
     DEFAULT_CHECK_INTERVAL,
     DEFAULT_MAX_SMS_LENGTH,
     DEFAULT_IMAP_PORT,
@@ -1054,6 +1056,7 @@ class EmailMonitorApp:
         "telegram": ("Telegram",         "Notifications"),
         "discord":  ("Discord",          "Notifications"),
         "webhook":  ("Custom Webhook",   "Notifications"),
+        "smtp":     ("Email (SMTP)",     "Notifications"),
         "logs":     ("Activity Logs",    "Monitor"),
     }
 
@@ -1122,6 +1125,7 @@ class EmailMonitorApp:
         self.telegram_var = tk.BooleanVar(value=self.config.getboolean('Telegram', 'enabled', fallback=False))
         self.discord_var = tk.BooleanVar(value=self.config.getboolean('Discord', 'enabled', fallback=False))
         self.webhook_var = tk.BooleanVar(value=self.config.getboolean('CustomWebhook', 'enabled', fallback=False))
+        self.smtp_var = tk.BooleanVar(value=self.config.getboolean('SMTP', 'enabled', fallback=False))
         self.auto_scroll_var = tk.BooleanVar(value=True)
         self.show_password_var = tk.BooleanVar(value=False)
 
@@ -1133,13 +1137,13 @@ class EmailMonitorApp:
         return [
             self.twilio_sms_var, self.voice_var, self.whatsapp_var,
             self.slack_var, self.telegram_var, self.discord_var,
-            self.webhook_var,
+            self.webhook_var, self.smtp_var,
         ]
 
     def _update_services_badge(self):
         if hasattr(self, '_services_badge'):
             count = sum(1 for v in self._service_vars() if v.get())
-            self._services_badge.update_count(count)
+            self._services_badge.update_count(count, total=8)
 
     def _create_layout(self):
         """Create the main layout structure."""
@@ -1248,6 +1252,7 @@ class EmailMonitorApp:
             ("telegram", "Telegram", 0, self.telegram_var, "Telegram bot messages"),
             ("discord", "Discord", 0, self.discord_var, "Discord webhook notifications"),
             ("webhook", "Webhook", 0, self.webhook_var, "Custom HTTP webhook"),
+            ("smtp", "Email (SMTP)", 0, self.smtp_var, "Email notifications via SMTP"),
         ]
         for key, text, indent, var, tip in notification_items:
             item = SidebarItem(
@@ -1385,6 +1390,7 @@ class EmailMonitorApp:
         self._create_telegram_page()
         self._create_discord_page()
         self._create_webhook_page()
+        self._create_smtp_page()
         self._create_logs_page()
 
     def _create_scrollable_page(self, name: str) -> tk.Frame:
@@ -1658,6 +1664,138 @@ class EmailMonitorApp:
         self.webhook_url = rows["webhook_url"]
         self.webhook_url.set(self.config.get('CustomWebhook', 'webhook_url', fallback=''))
 
+    def _create_smtp_page(self):
+        page = self._create_scrollable_page("smtp")
+
+        # Enable toggle
+        toggle_frame = tk.Frame(
+            page, bg=Theme.BG_PRIMARY,
+            highlightbackground=Theme.CARD_BORDER, highlightthickness=1,
+        )
+        toggle_frame.pack(fill="x", pady=(0, 24))
+        ToggleSwitch(toggle_frame, "Enable Email Notifications", self.smtp_var).pack(fill="x")
+
+        # Server settings
+        section1 = FormSection(page, "SMTP Server", "Configure your outgoing mail server")
+        section1.pack(fill="x", pady=(0, 24))
+
+        self.smtp_server = FormRow(
+            section1.content, "Server", "e.g., smtp.gmail.com",
+            tooltip="SMTP server hostname for sending emails",
+        )
+        self.smtp_server.pack(fill="x")
+        self.smtp_server.set(self.config.get('SMTP', 'smtp_server', fallback='smtp.gmail.com'))
+
+        self._create_separator(section1.content)
+
+        self.smtp_port = FormRow(
+            section1.content, "Port", "587 (TLS) or 465 (SSL)",
+            tooltip="SMTP port (587 for STARTTLS, 465 for SSL)",
+        )
+        self.smtp_port.pack(fill="x")
+        self.smtp_port.set(self.config.get('SMTP', 'smtp_port', fallback='587'))
+
+        self._create_separator(section1.content)
+
+        # TLS toggle
+        self.smtp_tls_var = tk.BooleanVar(value=self.config.getboolean('SMTP', 'use_tls', fallback=True))
+        tls_frame = tk.Frame(section1.content, bg=Theme.BG_PRIMARY)
+        tls_frame.pack(fill="x")
+        ToggleSwitch(tls_frame, "Use TLS Encryption", self.smtp_tls_var).pack(fill="x")
+
+        # Credentials
+        section2 = FormSection(page, "Credentials", "SMTP authentication details")
+        section2.pack(fill="x", pady=(0, 24))
+
+        self.smtp_username = FormRow(
+            section2.content, "Username", "Your email address",
+            tooltip="Username for SMTP authentication (usually your email)",
+        )
+        self.smtp_username.pack(fill="x")
+        self.smtp_username.set(self.config.get('SMTP', 'username', fallback=''))
+
+        self._create_separator(section2.content)
+
+        self.smtp_password = FormRow(
+            section2.content, "Password", "App password if 2FA enabled", show="*",
+            tooltip="Password for SMTP authentication",
+        )
+        self.smtp_password.pack(fill="x")
+        self.smtp_password.set(self.config.get('SMTP', 'password', fallback=''))
+
+        # Test button
+        btn_frame = tk.Frame(page, bg=Theme.BG_SECONDARY)
+        btn_frame.pack(fill="x", pady=(0, 24))
+
+        ModernButton(
+            btn_frame, text="Test Connection",
+            command=self._test_smtp_connection,
+            bg=Theme.BG_PRIMARY, fg=Theme.TEXT_PRIMARY,
+            hover_bg=Theme.BG_TERTIARY,
+            tooltip="Verify SMTP server connection",
+        ).pack(side="left")
+
+        # Email settings
+        section3 = FormSection(page, "Email Settings", "Configure sender and recipients")
+        section3.pack(fill="x", pady=(0, 24))
+
+        self.smtp_from = FormRow(
+            section3.content, "From Address", "notifications@example.com",
+            tooltip="Email address to send notifications from",
+        )
+        self.smtp_from.pack(fill="x")
+        self.smtp_from.set(self.config.get('SMTP', 'from_address', fallback=''))
+
+        self._create_separator(section3.content)
+
+        self.smtp_to = FormRow(
+            section3.content, "To Address(es)", "Comma-separated",
+            tooltip="Email addresses to receive notifications",
+        )
+        self.smtp_to.pack(fill="x")
+        self.smtp_to.set(self.config.get('SMTP', 'to_addresses', fallback=''))
+
+        self._create_separator(section3.content)
+
+        self.smtp_prefix = FormRow(
+            section3.content, "Subject Prefix", "[E2NB]",
+            tooltip="Prefix added to notification email subjects",
+        )
+        self.smtp_prefix.pack(fill="x")
+        self.smtp_prefix.set(self.config.get('SMTP', 'subject_prefix', fallback='[E2NB]'))
+
+    def _test_smtp_connection(self):
+        """Test SMTP connection with current settings."""
+        self._log("Testing SMTP connection...", "INFO")
+        self._update_status_bar("Testing SMTP connection...")
+
+        def test():
+            cfg = SmtpConfig(
+                smtp_server=self.smtp_server.get(),
+                smtp_port=int(self.smtp_port.get() or 587),
+                use_tls=self.smtp_tls_var.get(),
+                username=self.smtp_username.get(),
+                password=self.smtp_password.get(),
+                from_address=self.smtp_from.get(),
+                to_addresses=[],
+                subject_prefix=self.smtp_prefix.get()
+            )
+            success, msg = test_smtp_connection(cfg)
+            self.root.after(0, lambda: self._on_smtp_test_result(success, msg))
+
+        threading.Thread(target=test, daemon=True).start()
+
+    def _on_smtp_test_result(self, success: bool, message: str):
+        """Handle SMTP connection test result."""
+        if success:
+            self._log(message, "SUCCESS")
+            self.toast.show(message, "success")
+            self._update_status_bar("SMTP connection test passed")
+        else:
+            self._log(f"SMTP test failed: {message}", "ERROR")
+            self.toast.show(f"SMTP connection failed: {message}", "error")
+            self._update_status_bar("SMTP connection test failed")
+
     def _create_logs_page(self):
         page = tk.Frame(self.content, bg=Theme.BG_SECONDARY)
         self.pages["logs"] = page
@@ -1805,6 +1943,19 @@ class EmailMonitorApp:
         self.config['Discord']['webhook_url'] = self.discord_url.get()
 
         self.config['CustomWebhook']['webhook_url'] = self.webhook_url.get()
+
+        # SMTP settings
+        if 'SMTP' not in self.config:
+            self.config['SMTP'] = {}
+        self.config['SMTP']['enabled'] = str(self.smtp_var.get())
+        self.config['SMTP']['smtp_server'] = self.smtp_server.get()
+        self.config['SMTP']['smtp_port'] = self.smtp_port.get()
+        self.config['SMTP']['use_tls'] = str(self.smtp_tls_var.get())
+        self.config['SMTP']['username'] = self.smtp_username.get()
+        self.config['SMTP']['password'] = self.smtp_password.get()
+        self.config['SMTP']['from_address'] = self.smtp_from.get()
+        self.config['SMTP']['to_addresses'] = self.smtp_to.get()
+        self.config['SMTP']['subject_prefix'] = self.smtp_prefix.get()
 
     def _save_settings(self):
         try:
