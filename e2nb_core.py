@@ -178,7 +178,11 @@ class EmailConfig:
     @classmethod
     def from_config(cls, config: configparser.ConfigParser) -> 'EmailConfig':
         """Create EmailConfig from ConfigParser."""
-        section = config['Email'] if 'Email' in config else {}
+        # Return default config if [Email] section is missing
+        if 'Email' not in config:
+            return cls()
+
+        section = config['Email']
         filter_str = section.get('filter_emails', '')
         filters = [f.strip().lower() for f in filter_str.split(',') if f.strip()]
 
@@ -1897,6 +1901,27 @@ def _strip_html(html_text: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
+def _decode_payload(part, payload: bytes) -> str:
+    """
+    Decode email payload using the declared charset.
+
+    Falls back to UTF-8 if charset is not declared or decoding fails.
+
+    Args:
+        part: Email MIME part (for charset info).
+        payload: Raw payload bytes.
+
+    Returns:
+        Decoded string.
+    """
+    charset = part.get_content_charset() or 'utf-8'
+    try:
+        return payload.decode(charset, errors='replace')
+    except (LookupError, UnicodeDecodeError):
+        # Unknown charset or decode failed - fall back to utf-8
+        return payload.decode('utf-8', errors='replace')
+
+
 def extract_email_body(msg: Message) -> str:
     """
     Extract plain text body from an email message.
@@ -1918,14 +1943,14 @@ def extract_email_body(msg: Message) -> str:
                 content_type = part.get_content_type()
                 content_disposition = part.get("Content-Disposition")
 
-                # Skip attachments
-                if content_disposition:
+                # Skip attachments (but allow inline parts)
+                if content_disposition and content_disposition.lower().startswith('attachment'):
                     continue
 
                 payload = part.get_payload(decode=True)
                 if not payload:
                     continue
-                decoded = payload.decode("utf-8", errors='ignore')
+                decoded = _decode_payload(part, payload)
 
                 if content_type == "text/plain" and not plain_body:
                     plain_body = decoded
@@ -1941,7 +1966,7 @@ def extract_email_body(msg: Message) -> str:
         else:
             payload = msg.get_payload(decode=True)
             if payload:
-                decoded = payload.decode("utf-8", errors='ignore')
+                decoded = _decode_payload(msg, payload)
                 if msg.get_content_type() == "text/html":
                     return _strip_html(decoded)
                 return decoded
@@ -4032,8 +4057,12 @@ def check_http_endpoint(
             if headers and 'content-type' in {k.lower() for k in headers}:
                 request_kwargs['data'] = body
             elif body.strip().startswith('{') or body.strip().startswith('['):
-                # Looks like JSON
-                request_kwargs['json'] = json.loads(body) if isinstance(body, str) else body
+                # Looks like JSON - try to parse, fall back to raw data if invalid
+                try:
+                    request_kwargs['json'] = json.loads(body) if isinstance(body, str) else body
+                except json.JSONDecodeError:
+                    # Invalid JSON - send as raw data instead
+                    request_kwargs['data'] = body
             else:
                 request_kwargs['data'] = body
 
@@ -4073,8 +4102,6 @@ def check_http_endpoint(
         else:
             return False, response.status_code, response_time, f"Response did not match regex pattern '{expected_text_regex}'", response_excerpt
 
-    except json.JSONDecodeError as e:
-        return False, 0, 0.0, f"Invalid JSON body: {e}", ""
     except requests.Timeout:
         return False, 0, float(timeout), f"Request timed out after {timeout}s", ""
     except requests.exceptions.SSLError as e:
