@@ -75,7 +75,7 @@ e2nb/
 ├── e2nb-headless.py      # Headless daemon for server deployment
 ├── config.ini            # Configuration file (auto-created on first run)
 ├── requirements.txt      # Python dependencies
-├── monitor_state.json    # Persistent state file (auto-created at runtime)
+├── e2nb_state.json    # Persistent state file (auto-created at runtime)
 └── monitor/              # Screenshot assets for documentation
     ├── emailsettings.png
     ├── integrations.png
@@ -715,7 +715,7 @@ StandardError=journal
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/log/e2nb.log /opt/e2nb/monitor_state.json
+ReadWritePaths=/var/log/e2nb.log /opt/e2nb/e2nb_state.json
 PrivateTmp=yes
 
 [Install]
@@ -763,7 +763,7 @@ CMD ["python", "e2nb-headless.py", "-c", "/etc/e2nb/config.ini", "-l", "/var/log
 docker build -t e2nb .
 docker run -d --name e2nb \
   -v /path/to/config.ini:/etc/e2nb/config.ini:ro \
-  -v /path/to/state:/app/monitor_state.json \
+  -v /path/to/state:/app/e2nb_state.json \
   e2nb
 ```
 
@@ -798,7 +798,7 @@ POP3 is an alternative for servers that don't support IMAP. E2NB tracks processe
 1. Connects via SSL (port 995) or STARTTLS (port 110)
 2. Lists available messages
 3. Downloads each message and computes an MD5 hash of `sender + subject + body`
-4. Skips messages whose hash has already been seen (persisted in `monitor_state.json`)
+4. Skips messages whose hash has already been seen (persisted in `e2nb_state.json`)
 5. Dispatches notifications for new messages
 6. Deletes the message from the server if notification succeeds
 7. Periodically cleans up old hash records
@@ -849,7 +849,7 @@ E2NB uses `feedparser` to poll RSS and Atom feeds at the configured interval.
 **How it works**:
 1. Parses each feed URL
 2. For each entry, generates a unique ID from the entry's `guid` or `link`
-3. Compares against seen items persisted in `monitor_state.json`
+3. Compares against seen items persisted in `e2nb_state.json`
 4. Filters by age (skips items older than `max_age_hours`)
 5. Filters by keywords if configured (checks title and summary)
 6. Creates a notification with the item's title and content
@@ -874,7 +874,7 @@ E2NB detects changes by computing SHA-256 hashes of page content and comparing a
 2. If a CSS `selector` is specified and BeautifulSoup is available, extracts only the matching element's text
 3. If no selector, uses the full page body text
 4. Computes SHA-256 hash of the normalized content
-5. Compares against the stored hash in `monitor_state.json`
+5. Compares against the stored hash in `e2nb_state.json`
 6. If different (and not the first check), sends a change notification
 7. Updates the stored hash
 
@@ -913,7 +913,7 @@ E2NB monitors endpoint availability by making HTTP requests and checking the res
 
 ## State Management
 
-E2NB persists monitoring state in `monitor_state.json` to survive restarts. This file is managed automatically.
+E2NB persists monitoring state in `e2nb_state.json` to survive restarts. This file is managed automatically.
 
 **Tracked state**:
 - `seen_rss_items`: Per-feed set of item IDs to avoid duplicate notifications
@@ -1034,7 +1034,7 @@ Persistent state management for monitoring sources.
 ```python
 from e2nb_core import MonitorState
 
-state = MonitorState()  # Loads from monitor_state.json
+state = MonitorState()  # Loads from e2nb_state.json
 
 # RSS tracking
 state.is_rss_item_seen('feed_name', 'item_id')
@@ -1181,10 +1181,10 @@ If monitoring is producing duplicate notifications or missing events:
 
 ```bash
 # View current state
-python -c "import json; print(json.dumps(json.load(open('monitor_state.json')), indent=2))"
+python -c "import json; print(json.dumps(json.load(open('e2nb_state.json')), indent=2))"
 
 # Reset state (will re-process items on next cycle)
-rm monitor_state.json
+rm e2nb_state.json
 ```
 
 ---
