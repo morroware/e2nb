@@ -27,7 +27,10 @@ from e2nb_core import (
     load_config,
     setup_logging,
     connect_to_imap,
+    connect_to_pop3,
     fetch_unread_emails,
+    fetch_pop3_emails,
+    delete_pop3_message,
     extract_email_body,
     decode_email_subject,
     get_sender_email,
@@ -37,6 +40,8 @@ from e2nb_core import (
     NotificationDispatcher,
     NotificationResult,
     EmailConfig,
+    SmtpReceiverConfig,
+    SmtpReceiver,
     RssFeedConfig,
     WebMonitorConfig,
     HttpEndpointConfig,
@@ -45,8 +50,10 @@ from e2nb_core import (
     check_web_pages,
     check_http_endpoints,
     ConfigurationError,
+    AIOSMTPD_AVAILABLE,
     DEFAULT_CHECK_INTERVAL,
     DEFAULT_IMAP_PORT,
+    DEFAULT_POP3_PORT,
     CONFIG_FILE_PATH,
     LOG_FILE_PATH,
     logger,
@@ -75,6 +82,7 @@ class EmailMonitorDaemon:
         self.running = False
         self.stop_event = threading.Event()
         self.monitor_thread: Optional[threading.Thread] = None
+        self.smtp_receiver: Optional[SmtpReceiver] = None
 
     def load_configuration(self) -> bool:
         """
@@ -114,17 +122,20 @@ class EmailMonitorDaemon:
             )
             return False
 
-        # Check email settings
-        email_section = self.config['Email'] if 'Email' in self.config else {}
-        required_fields = ['imap_server', 'imap_port', 'username', 'password']
+        # Check email settings - IMAP is required unless SMTP receiver is enabled
+        smtp_receiver_enabled = self.config.getboolean('SmtpReceiver', 'enabled', fallback=False)
+        if not smtp_receiver_enabled:
+            email_section = self.config['Email'] if 'Email' in self.config else {}
+            required_fields = ['imap_server', 'imap_port', 'username', 'password']
 
-        for field in required_fields:
-            if not email_section.get(field):
-                logging.error(
-                    f"Missing required email configuration: {field}. "
-                    "Please check config.ini."
-                )
-                return False
+            for field in required_fields:
+                if not email_section.get(field):
+                    logging.error(
+                        f"Missing required email configuration: {field}. "
+                        "Please check config.ini. "
+                        "(Or enable SmtpReceiver as an alternative to IMAP.)"
+                    )
+                    return False
 
         # Validate check interval
         try:
@@ -181,6 +192,24 @@ class EmailMonitorDaemon:
 
         logging.info(f"Enabled notification methods: {', '.join(enabled_methods)}")
 
+        # Start SMTP receiver if enabled
+        smtp_recv_config = SmtpReceiverConfig.from_config(self.config)
+        if smtp_recv_config.enabled:
+            if not AIOSMTPD_AVAILABLE:
+                logging.error("SMTP receiver enabled but aiosmtpd not installed (pip install aiosmtpd)")
+                return False
+
+            self.smtp_receiver = SmtpReceiver(
+                config=smtp_recv_config,
+                callback=self._on_smtp_received,
+            )
+            success, msg = self.smtp_receiver.start()
+            if success:
+                logging.info(msg)
+            else:
+                logging.error(msg)
+                return False
+
         # Start monitoring thread
         self.monitor_thread = threading.Thread(
             target=self._monitor_loop,
@@ -201,6 +230,10 @@ class EmailMonitorDaemon:
         self.running = False
         self.stop_event.set()
 
+        # Stop SMTP receiver
+        if self.smtp_receiver and self.smtp_receiver.is_running:
+            self.smtp_receiver.stop()
+
         # Wait for monitor thread to finish
         if self.monitor_thread and self.monitor_thread.is_alive():
             self.monitor_thread.join(timeout=10)
@@ -208,6 +241,11 @@ class EmailMonitorDaemon:
                 logging.warning("Monitor thread did not stop cleanly")
 
         logging.info("E2NB daemon stopped")
+
+    def _on_smtp_received(self, notification: EmailNotification):
+        """Handle an email received via the SMTP receiver."""
+        logging.info(f"[SMTP Receiver] Email from {notification.sender}: {notification.subject[:60]}")
+        self._dispatch_notification(notification)
 
     def _monitor_loop(self):
         """Main monitoring loop."""
@@ -232,6 +270,7 @@ class EmailMonitorDaemon:
 
         while not self.stop_event.is_set():
             imap = None
+            pop3 = None
             try:
                 # Get configuration values
                 check_interval = int(
@@ -243,31 +282,69 @@ class EmailMonitorDaemon:
                     if f.strip()
                 ]
 
-                # =====================================================
-                # Check Email (IMAP)
-                # =====================================================
-                imap = connect_to_imap(
-                    self.config.get('Email', 'imap_server'),
-                    int(self.config.get('Email', 'imap_port', fallback=str(DEFAULT_IMAP_PORT))),
-                    self.config.get('Email', 'username'),
-                    self.config.get('Email', 'password')
-                )
+                email_username = self.config.get('Email', 'username', fallback='')
+                protocol = self.config.get('Email', 'protocol', fallback='imap').lower()
 
-                if imap:
-                    unread_emails = fetch_unread_emails(imap)
-                    email_count = len(unread_emails)
+                # =====================================================
+                # Check Email (IMAP or POP3)
+                # =====================================================
+                if email_username and protocol == 'imap':
+                    imap = connect_to_imap(
+                        self.config.get('Email', 'imap_server'),
+                        int(self.config.get('Email', 'imap_port', fallback=str(DEFAULT_IMAP_PORT))),
+                        email_username,
+                        self.config.get('Email', 'password')
+                    )
 
-                    if email_count > 0:
-                        logging.info(f"Found {email_count} unread email(s)")
+                    if imap:
+                        unread_emails = fetch_unread_emails(imap)
+                        email_count = len(unread_emails)
+
+                        if email_count > 0:
+                            logging.info(f"Found {email_count} unread email(s)")
+                        else:
+                            logging.debug("No unread emails found")
+
+                        for email_id, msg in unread_emails:
+                            if self.stop_event.is_set():
+                                break
+                            self._process_email(imap, email_id, msg, filter_emails)
                     else:
-                        logging.debug("No unread emails found")
+                        logging.warning("Failed to connect to IMAP server")
 
-                    for email_id, msg in unread_emails:
-                        if self.stop_event.is_set():
-                            break
-                        self._process_email(imap, email_id, msg, filter_emails)
-                else:
-                    logging.warning("Failed to connect to IMAP server")
+                elif email_username and protocol == 'pop3':
+                    pop3 = connect_to_pop3(
+                        self.config.get('Email', 'pop3_server'),
+                        int(self.config.get('Email', 'pop3_port', fallback=str(DEFAULT_POP3_PORT))),
+                        email_username,
+                        self.config.get('Email', 'password')
+                    )
+
+                    if pop3:
+                        pop3_emails = fetch_pop3_emails(pop3)
+                        email_count = len(pop3_emails)
+
+                        if email_count > 0:
+                            logging.info(f"Found {email_count} email(s) via POP3")
+
+                        for msg_num, msg in pop3_emails:
+                            if self.stop_event.is_set():
+                                break
+                            sender = get_sender_email(msg)
+                            if filter_emails and not check_email_filter(sender, filter_emails):
+                                continue
+                            subject = decode_email_subject(msg)
+                            body = extract_email_body(msg)
+                            notification = EmailNotification(
+                                email_id=str(msg_num).encode(),
+                                sender=sender,
+                                subject=subject,
+                                body=body
+                            )
+                            self._dispatch_notification(notification)
+                            delete_pop3_message(pop3, msg_num)
+                    else:
+                        logging.warning("Failed to connect to POP3 server")
 
                 # =====================================================
                 # Check RSS Feeds
@@ -314,13 +391,19 @@ class EmailMonitorDaemon:
             except Exception as e:
                 logging.error(f"Error in monitoring loop: {e}", exc_info=True)
             finally:
-                # Clean up IMAP connection
+                # Clean up connections
                 if imap:
                     try:
                         imap.logout()
                         logging.debug("Logged out from IMAP server")
                     except Exception as e:
                         logging.debug(f"Error during IMAP logout: {e}")
+                if pop3:
+                    try:
+                        pop3.quit()
+                        logging.debug("Disconnected from POP3 server")
+                    except Exception as e:
+                        logging.debug(f"Error during POP3 quit: {e}")
 
                 # Wait for next check cycle
                 if not self.stop_event.is_set():
@@ -543,22 +626,50 @@ def test_configuration(config_file: str) -> bool:
         print("\nConfiguration test FAILED")
         return False
 
-    # Test IMAP connection
-    print("\nTesting IMAP connection...")
+    # Test IMAP connection (only if SMTP receiver is not the sole email source)
     email_config = EmailConfig.from_config(daemon.config)
+    smtp_recv_enabled = daemon.config.getboolean('SmtpReceiver', 'enabled', fallback=False)
 
-    imap = connect_to_imap(
-        email_config.imap_server,
-        email_config.imap_port,
-        email_config.username,
-        email_config.password
-    )
-
-    if imap:
-        print(f"  Connected to {email_config.imap_server}:{email_config.imap_port}")
-        imap.logout()
-    else:
-        print(f"  FAILED to connect to {email_config.imap_server}:{email_config.imap_port}")
+    if email_config.username:
+        protocol = email_config.protocol
+        if protocol == 'pop3':
+            print(f"\nTesting POP3 connection...")
+            pop3 = connect_to_pop3(
+                email_config.pop3_server,
+                email_config.pop3_port,
+                email_config.username,
+                email_config.password
+            )
+            if pop3:
+                print(f"  Connected to {email_config.pop3_server}:{email_config.pop3_port}")
+                pop3.quit()
+            else:
+                print(f"  FAILED to connect to {email_config.pop3_server}:{email_config.pop3_port}")
+                if not smtp_recv_enabled:
+                    print("\nConfiguration test FAILED")
+                    return False
+                else:
+                    print("  (SMTP receiver is enabled as alternative)")
+        else:
+            print("\nTesting IMAP connection...")
+            imap = connect_to_imap(
+                email_config.imap_server,
+                email_config.imap_port,
+                email_config.username,
+                email_config.password
+            )
+            if imap:
+                print(f"  Connected to {email_config.imap_server}:{email_config.imap_port}")
+                imap.logout()
+            else:
+                print(f"  FAILED to connect to {email_config.imap_server}:{email_config.imap_port}")
+                if not smtp_recv_enabled:
+                    print("\nConfiguration test FAILED")
+                    return False
+                else:
+                    print("  (SMTP receiver is enabled as alternative)")
+    elif not smtp_recv_enabled:
+        print("\nNo email source configured (IMAP or SMTP Receiver)")
         print("\nConfiguration test FAILED")
         return False
 
@@ -579,6 +690,14 @@ def test_configuration(config_file: str) -> bool:
         enabled = daemon.config.getboolean(section, key, fallback=False)
         status = "ENABLED" if enabled else "disabled"
         print(f"  {name}: {status}")
+
+    # SMTP Receiver
+    smtp_recv_enabled = daemon.config.getboolean('SmtpReceiver', 'enabled', fallback=False)
+    print(f"\nSMTP Receiver: {'ENABLED' if smtp_recv_enabled else 'disabled'}")
+    if smtp_recv_enabled:
+        host = daemon.config.get('SmtpReceiver', 'host', fallback='0.0.0.0')
+        port = daemon.config.get('SmtpReceiver', 'port', fallback='2525')
+        print(f"  Listening on {host}:{port}")
 
     # Show enabled monitoring sources
     print("\nEnabled monitoring sources:")
