@@ -70,6 +70,10 @@ from e2nb_core import (
     SmtpConfig,
     SmtpReceiverConfig,
     SmtpReceiver,
+    TeamsConfig,
+    PushoverConfig,
+    NtfyConfig,
+    NotificationRulesConfig,
     RssFeedConfig,
     WebMonitorConfig,
     HttpEndpointConfig,
@@ -1092,8 +1096,12 @@ class EmailMonitorApp:
         "slack":    ("Slack",            "Notifications"),
         "telegram": ("Telegram",         "Notifications"),
         "discord":  ("Discord",          "Notifications"),
+        "teams":    ("Microsoft Teams",  "Notifications"),
+        "pushover": ("Pushover",         "Notifications"),
+        "ntfy":     ("Ntfy",             "Notifications"),
         "webhook":  ("Custom Webhook",   "Notifications"),
         "smtp":     ("Email (SMTP)",     "Notifications"),
+        "rules":    ("Notification Rules", "Configuration"),
         "logs":     ("Activity Logs",    "Monitor"),
     }
 
@@ -1165,8 +1173,12 @@ class EmailMonitorApp:
         self.slack_var = tk.BooleanVar(value=self.config.getboolean('Slack', 'enabled', fallback=False))
         self.telegram_var = tk.BooleanVar(value=self.config.getboolean('Telegram', 'enabled', fallback=False))
         self.discord_var = tk.BooleanVar(value=self.config.getboolean('Discord', 'enabled', fallback=False))
+        self.teams_var = tk.BooleanVar(value=self.config.getboolean('Teams', 'enabled', fallback=False))
+        self.pushover_var = tk.BooleanVar(value=self.config.getboolean('Pushover', 'enabled', fallback=False))
+        self.ntfy_var = tk.BooleanVar(value=self.config.getboolean('Ntfy', 'enabled', fallback=False))
         self.webhook_var = tk.BooleanVar(value=self.config.getboolean('CustomWebhook', 'enabled', fallback=False))
         self.smtp_var = tk.BooleanVar(value=self.config.getboolean('SMTP', 'enabled', fallback=False))
+        self.rules_var = tk.BooleanVar(value=self.config.getboolean('NotificationRules', 'enabled', fallback=False))
 
         # SMTP Receiver
         self.smtp_recv_var = tk.BooleanVar(value=self.config.getboolean('SmtpReceiver', 'enabled', fallback=False))
@@ -1199,6 +1211,7 @@ class EmailMonitorApp:
         return [
             self.twilio_sms_var, self.voice_var, self.whatsapp_var,
             self.slack_var, self.telegram_var, self.discord_var,
+            self.teams_var, self.pushover_var, self.ntfy_var,
             self.webhook_var, self.smtp_var,
         ]
 
@@ -1208,7 +1221,7 @@ class EmailMonitorApp:
     def _update_services_badge(self):
         if hasattr(self, '_services_badge'):
             count = sum(1 for v in self._service_vars() if v.get())
-            self._services_badge.update_count(count, total=8)
+            self._services_badge.update_count(count, total=11)
 
     def _update_sources_badge(self):
         if hasattr(self, '_sources_badge'):
@@ -1351,9 +1364,12 @@ class EmailMonitorApp:
             ("sms", "Twilio SMS", 0, self.twilio_sms_var, "SMS notifications via Twilio"),
             ("voice", "Twilio Voice", 0, self.voice_var, "Voice call notifications"),
             ("whatsapp", "WhatsApp", 0, self.whatsapp_var, "WhatsApp messages via Twilio"),
-            ("slack", "Slack", 0, self.slack_var, "Slack channel notifications"),
+            ("slack", "Slack", 0, self.slack_var, "Slack with @mentions and DMs"),
             ("telegram", "Telegram", 0, self.telegram_var, "Telegram bot messages"),
             ("discord", "Discord", 0, self.discord_var, "Discord webhook notifications"),
+            ("teams", "Teams", 0, self.teams_var, "Microsoft Teams webhook notifications"),
+            ("pushover", "Pushover", 0, self.pushover_var, "Push notifications via Pushover"),
+            ("ntfy", "Ntfy", 0, self.ntfy_var, "Push notifications via ntfy.sh"),
             ("webhook", "Webhook", 0, self.webhook_var, "Custom HTTP webhook"),
             ("smtp", "Email (SMTP)", 0, self.smtp_var, "Email notifications via SMTP"),
         ]
@@ -1374,6 +1390,7 @@ class EmailMonitorApp:
 
         config_items = [
             ("settings", "General", 0, None, "Monitoring interval and SMS settings"),
+            ("rules", "Routing Rules", 0, self.rules_var, "Conditional notification routing"),
         ]
         for key, text, indent, var, tip in config_items:
             item = SidebarItem(
@@ -1506,8 +1523,12 @@ class EmailMonitorApp:
         self._create_slack_page()
         self._create_telegram_page()
         self._create_discord_page()
+        self._create_teams_page()
+        self._create_pushover_page()
+        self._create_ntfy_page()
         self._create_webhook_page()
         self._create_smtp_page()
+        self._create_rules_page()
         self._create_rss_page()
         self._create_webmon_page()
         self._create_httpmon_page()
@@ -1976,12 +1997,20 @@ class EmailMonitorApp:
                     ("slack_token", "Bot Token", "Starts with xoxb-", "*", "Create a Slack app and get the bot token"),
                     ("slack_channel", "Channel", "e.g., #notifications", "", "Channel where messages will be posted"),
                 ]),
+                ("User Mentions & DMs", "Tag and DM Slack users directly", [
+                    ("slack_mention", "Mention Users", "Comma-separated user IDs", "", "@mention these users in channel messages (e.g., U01ABC,U02DEF)"),
+                    ("slack_dm", "DM Users", "Comma-separated user IDs", "", "Send direct messages to these users (e.g., U01ABC,U02DEF)"),
+                ]),
             ],
         )
         self.slack_token = rows["slack_token"]
         self.slack_token.set(self.config.get('Slack', 'token', fallback=''))
         self.slack_channel = rows["slack_channel"]
         self.slack_channel.set(self.config.get('Slack', 'channel', fallback=''))
+        self.slack_mention = rows["slack_mention"]
+        self.slack_mention.set(self.config.get('Slack', 'mention_users', fallback=''))
+        self.slack_dm = rows["slack_dm"]
+        self.slack_dm.set(self.config.get('Slack', 'dm_users', fallback=''))
 
     def _create_telegram_page(self):
         rows = self._create_notification_page(
@@ -2009,6 +2038,196 @@ class EmailMonitorApp:
         )
         self.discord_url = rows["discord_url"]
         self.discord_url.set(self.config.get('Discord', 'webhook_url', fallback=''))
+
+    def _create_teams_page(self):
+        rows = self._create_notification_page(
+            "teams", "Enable Microsoft Teams", self.teams_var,
+            [
+                ("Teams Webhook", "Incoming Webhook URL from Teams channel", [
+                    ("teams_url", "Webhook URL", "From Teams channel connector", "", "Create an Incoming Webhook in Teams channel settings"),
+                ]),
+            ],
+        )
+        self.teams_url = rows["teams_url"]
+        self.teams_url.set(self.config.get('Teams', 'webhook_url', fallback=''))
+
+    def _create_pushover_page(self):
+        rows = self._create_notification_page(
+            "pushover", "Enable Pushover", self.pushover_var,
+            [
+                ("Pushover Credentials", "Your Pushover application and user keys", [
+                    ("po_token", "API Token", "Application API token", "*", "Register an app at pushover.net"),
+                    ("po_user", "User Key", "User or group key", "", "Your Pushover user key"),
+                ]),
+                ("Notification Options", "Customize push notification behavior", [
+                    ("po_priority", "Priority", "-2=lowest, -1=low, 0=normal, 1=high, 2=emergency", "", "Notification priority level"),
+                    ("po_sound", "Sound", "e.g., pushover, bike, bugle", "", "Custom notification sound (empty = default)"),
+                    ("po_device", "Device", "Specific device name", "", "Target specific device (empty = all devices)"),
+                ]),
+            ],
+        )
+        self.po_token = rows["po_token"]
+        self.po_token.set(self.config.get('Pushover', 'api_token', fallback=''))
+        self.po_user = rows["po_user"]
+        self.po_user.set(self.config.get('Pushover', 'user_key', fallback=''))
+        self.po_priority = rows["po_priority"]
+        self.po_priority.set(self.config.get('Pushover', 'priority', fallback='0'))
+        self.po_sound = rows["po_sound"]
+        self.po_sound.set(self.config.get('Pushover', 'sound', fallback=''))
+        self.po_device = rows["po_device"]
+        self.po_device.set(self.config.get('Pushover', 'device', fallback=''))
+
+    def _create_ntfy_page(self):
+        rows = self._create_notification_page(
+            "ntfy", "Enable Ntfy", self.ntfy_var,
+            [
+                ("Ntfy Configuration", "Topic and server settings for ntfy.sh or self-hosted", [
+                    ("ntfy_server", "Server URL", "e.g., https://ntfy.sh", "", "Ntfy server URL (default: ntfy.sh)"),
+                    ("ntfy_topic", "Topic", "Your topic name", "", "Topic to publish notifications to"),
+                ]),
+                ("Notification Options", "Customize push notification behavior", [
+                    ("ntfy_priority", "Priority", "min, low, default, high, urgent", "", "Notification priority level"),
+                    ("ntfy_tags", "Tags", "Comma-separated emoji tags", "", "Emoji tags (e.g., warning,skull,rotating_light)"),
+                    ("ntfy_auth", "Auth Token", "Optional access token", "*", "Bearer token for authentication (if required)"),
+                ]),
+            ],
+        )
+        self.ntfy_server = rows["ntfy_server"]
+        self.ntfy_server.set(self.config.get('Ntfy', 'server_url', fallback='https://ntfy.sh'))
+        self.ntfy_topic = rows["ntfy_topic"]
+        self.ntfy_topic.set(self.config.get('Ntfy', 'topic', fallback=''))
+        self.ntfy_priority = rows["ntfy_priority"]
+        self.ntfy_priority.set(self.config.get('Ntfy', 'priority', fallback='default'))
+        self.ntfy_tags = rows["ntfy_tags"]
+        self.ntfy_tags.set(self.config.get('Ntfy', 'tags', fallback=''))
+        self.ntfy_auth = rows["ntfy_auth"]
+        self.ntfy_auth.set(self.config.get('Ntfy', 'auth_token', fallback=''))
+
+    def _create_rules_page(self):
+        """Create the notification routing rules page with a JSON editor."""
+        page = self._create_scrollable_page("rules")
+
+        # Enable toggle
+        toggle_frame = tk.Frame(
+            page, bg=Theme.BG_PRIMARY,
+            highlightbackground=Theme.CARD_BORDER, highlightthickness=1,
+        )
+        toggle_frame.pack(fill="x", pady=(0, 24))
+        ToggleSwitch(toggle_frame, "Enable Notification Rules", self.rules_var).pack(fill="x")
+
+        # Help section
+        help_section = FormSection(page, "How Rules Work",
+            "Route notifications conditionally based on source, sender, content, and severity")
+        help_section.pack(fill="x", pady=(0, 24))
+
+        help_text = (
+            "Rules are evaluated in order. Each rule can:\n"
+            "  - Match by source_type: email, rss, web, http\n"
+            "  - Match by sender_pattern / subject_pattern / body_pattern (regex)\n"
+            "  - Match by severity: info, warning, error, critical\n"
+            "  - Route to specific channels: sms, voice, whatsapp, slack, slack_dm,\n"
+            "    telegram, discord, teams, pushover, ntfy, webhook, email\n"
+            "  - Suppress notifications on specific channels\n\n"
+            "If no rules match a notification, it goes to all enabled channels (default)."
+        )
+
+        help_label = tk.Label(
+            help_section.content, text=help_text,
+            bg=Theme.BG_PRIMARY, fg=Theme.TEXT_SECONDARY,
+            font=(Theme.FONT_MONO, 9), justify="left", anchor="nw",
+            wraplength=600,
+        )
+        help_label.pack(fill="x", padx=16, pady=12)
+
+        # Rules JSON editor
+        rules_section = FormSection(page, "Rules Configuration",
+            "Define routing rules as a JSON array")
+        rules_section.pack(fill="x", pady=(0, 24))
+
+        self.rules_text = scrolledtext.ScrolledText(
+            rules_section.content, width=70, height=18,
+            font=(Theme.FONT_MONO, 10),
+            bg=Theme.BG_INPUT, fg=Theme.TEXT_PRIMARY,
+            insertbackground=Theme.TEXT_PRIMARY,
+            selectbackground=Theme.PRIMARY_LIGHT,
+            relief="flat", borderwidth=0,
+            wrap="word",
+        )
+        self.rules_text.pack(fill="x", padx=16, pady=12)
+
+        rules_json = self.config.get('NotificationRules', 'rules', fallback='[]')
+        # Pretty-print the JSON for readability
+        try:
+            parsed = json.loads(rules_json)
+            rules_json = json.dumps(parsed, indent=2)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        self.rules_text.insert("1.0", rules_json)
+
+        # Example template button
+        def _insert_example():
+            example = json.dumps([
+                {
+                    "name": "Critical errors to SMS + Voice",
+                    "enabled": True,
+                    "severity": "error",
+                    "channels": "sms,voice,slack",
+                    "suppress": False
+                },
+                {
+                    "name": "Only HTTP alerts to Teams",
+                    "enabled": True,
+                    "source_type": "http",
+                    "channels": "teams,pushover",
+                    "suppress": False
+                },
+                {
+                    "name": "Suppress RSS from Discord",
+                    "enabled": True,
+                    "source_type": "rss",
+                    "channels": "discord",
+                    "suppress": True
+                },
+                {
+                    "name": "Security alerts from specific sender",
+                    "enabled": True,
+                    "sender_pattern": "security@.*\\.com",
+                    "subject_pattern": "(urgent|critical|breach)",
+                    "channels": "sms,voice,slack,teams",
+                    "suppress": False
+                }
+            ], indent=2)
+            self.rules_text.delete("1.0", tk.END)
+            self.rules_text.insert("1.0", example)
+
+        btn_frame = tk.Frame(rules_section.content, bg=Theme.BG_PRIMARY)
+        btn_frame.pack(fill="x", padx=16, pady=(0, 12))
+
+        ModernButton(
+            btn_frame, text="Load Example Rules",
+            command=_insert_example,
+            bg=Theme.PRIMARY, hover_bg=Theme.PRIMARY_HOVER,
+            tooltip="Replace with example rules to use as a starting point",
+        ).pack(side="left")
+
+        def _validate_rules():
+            try:
+                rules_str = self.rules_text.get("1.0", tk.END).strip()
+                parsed = json.loads(rules_str)
+                if not isinstance(parsed, list):
+                    self.toast.show("Rules must be a JSON array", "error")
+                    return
+                count = len(parsed)
+                self.toast.show(f"Valid JSON: {count} rule(s) defined", "success")
+            except json.JSONDecodeError as e:
+                self.toast.show(f"Invalid JSON: {e}", "error")
+
+        ModernButton(
+            btn_frame, text="Validate JSON",
+            command=_validate_rules,
+            bg=Theme.SUCCESS, hover_bg=Theme.SUCCESS_HOVER,
+            tooltip="Check if the rules JSON is valid",
+        ).pack(side="left", padx=(8, 0))
 
     def _create_webhook_page(self):
         rows = self._create_notification_page(
@@ -2602,6 +2821,7 @@ class EmailMonitorApp:
         self.config['Telegram']['enabled'] = str(self.telegram_var.get())
         self.config['Discord']['enabled'] = str(self.discord_var.get())
         self.config['CustomWebhook']['enabled'] = str(self.webhook_var.get())
+        # Teams, Pushover, Ntfy enabled flags set below in their sections
 
         self.config['Twilio']['account_sid'] = self.sms_sid.get()
         self.config['Twilio']['auth_token'] = self.sms_token.get()
@@ -2620,13 +2840,47 @@ class EmailMonitorApp:
 
         self.config['Slack']['token'] = self.slack_token.get()
         self.config['Slack']['channel'] = self.slack_channel.get()
+        self.config['Slack']['mention_users'] = self.slack_mention.get()
+        self.config['Slack']['dm_users'] = self.slack_dm.get()
 
         self.config['Telegram']['bot_token'] = self.tg_token.get()
         self.config['Telegram']['chat_id'] = self.tg_chat.get()
 
         self.config['Discord']['webhook_url'] = self.discord_url.get()
 
+        # Teams settings
+        if 'Teams' not in self.config:
+            self.config['Teams'] = {}
+        self.config['Teams']['enabled'] = str(self.teams_var.get())
+        self.config['Teams']['webhook_url'] = self.teams_url.get()
+
+        # Pushover settings
+        if 'Pushover' not in self.config:
+            self.config['Pushover'] = {}
+        self.config['Pushover']['enabled'] = str(self.pushover_var.get())
+        self.config['Pushover']['api_token'] = self.po_token.get()
+        self.config['Pushover']['user_key'] = self.po_user.get()
+        self.config['Pushover']['priority'] = self.po_priority.get()
+        self.config['Pushover']['sound'] = self.po_sound.get()
+        self.config['Pushover']['device'] = self.po_device.get()
+
+        # Ntfy settings
+        if 'Ntfy' not in self.config:
+            self.config['Ntfy'] = {}
+        self.config['Ntfy']['enabled'] = str(self.ntfy_var.get())
+        self.config['Ntfy']['server_url'] = self.ntfy_server.get()
+        self.config['Ntfy']['topic'] = self.ntfy_topic.get()
+        self.config['Ntfy']['priority'] = self.ntfy_priority.get()
+        self.config['Ntfy']['tags'] = self.ntfy_tags.get()
+        self.config['Ntfy']['auth_token'] = self.ntfy_auth.get()
+
         self.config['CustomWebhook']['webhook_url'] = self.webhook_url.get()
+
+        # Notification rules
+        if 'NotificationRules' not in self.config:
+            self.config['NotificationRules'] = {}
+        self.config['NotificationRules']['enabled'] = str(self.rules_var.get())
+        self.config['NotificationRules']['rules'] = self.rules_text.get("1.0", tk.END).strip()
 
         # SMTP settings
         if 'SMTP' not in self.config:

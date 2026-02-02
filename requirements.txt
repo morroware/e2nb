@@ -7,7 +7,7 @@ twilio>=8.0.0
 # Slack SDK for Slack notifications
 slack_sdk>=3.20.0
 
-# HTTP library for Telegram, Discord, and webhooks
+# HTTP library for Telegram, Discord, Teams, Pushover, Ntfy, and webhooks
 requests>=2.28.0
 
 # Optional: urllib3 for retry logic (usually installed with requests)
