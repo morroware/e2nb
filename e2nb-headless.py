@@ -53,10 +53,15 @@ from e2nb_core import (
     RssFeedConfig,
     WebMonitorConfig,
     HttpEndpointConfig,
+    DatabaseMonitorConfig,
+    LogMonitorConfig,
+    MessageTemplateConfig,
     MonitorState,
     check_rss_feeds,
     check_web_pages,
     check_http_endpoints,
+    check_databases,
+    check_log_files,
     ConfigurationError,
     AIOSMTPD_AVAILABLE,
     DEFAULT_CHECK_INTERVAL,
@@ -219,12 +224,14 @@ class EmailMonitorDaemon:
             return False
 
         # Check email settings - email source is required unless SMTP receiver or
-        # other monitoring sources (RSS, Web, HTTP) are enabled
+        # other monitoring sources (RSS, Web, HTTP, Database, Log) are enabled
         smtp_receiver_enabled = config.getboolean('SmtpReceiver', 'enabled', fallback=False)
         rss_enabled = config.getboolean('RSS', 'enabled', fallback=False)
         web_enabled = config.getboolean('WebMonitor', 'enabled', fallback=False)
         http_enabled = config.getboolean('HttpMonitor', 'enabled', fallback=False)
-        has_other_sources = smtp_receiver_enabled or rss_enabled or web_enabled or http_enabled
+        db_enabled = config.getboolean('DatabaseMonitor', 'enabled', fallback=False)
+        log_enabled = config.getboolean('LogMonitor', 'enabled', fallback=False)
+        has_other_sources = smtp_receiver_enabled or rss_enabled or web_enabled or http_enabled or db_enabled or log_enabled
 
         if not has_other_sources:
             email_section = config['Email'] if 'Email' in config else {}
@@ -241,7 +248,7 @@ class EmailMonitorDaemon:
                     logging.error(
                         f"Missing required email configuration: {field}. "
                         "Please check config.ini. "
-                        "(Or enable SmtpReceiver/RSS/Web/HTTP monitoring as an alternative.)"
+                        "(Or enable SmtpReceiver/RSS/Web/HTTP/Database/Log monitoring as an alternative.)"
                     )
                     return False
 
@@ -383,6 +390,8 @@ class EmailMonitorDaemon:
         rss_config = RssFeedConfig.from_config(self.config)
         web_config = WebMonitorConfig.from_config(self.config)
         http_config = HttpEndpointConfig.from_config(self.config)
+        db_config = DatabaseMonitorConfig.from_config(self.config)
+        log_config = LogMonitorConfig.from_config(self.config)
 
         # Track per-source next-run timestamps for respecting individual check_intervals
         next_run_times = {
@@ -390,6 +399,8 @@ class EmailMonitorDaemon:
             'rss': 0.0,
             'web': 0.0,
             'http': 0.0,
+            'database': 0.0,
+            'log': 0.0,
         }
 
         def _log_enabled_sources():
@@ -401,6 +412,10 @@ class EmailMonitorDaemon:
                 sources.append(f"Web ({len(web_config.pages)} pages, {web_config.check_interval}s)")
             if http_config.enabled:
                 sources.append(f"HTTP ({len(http_config.endpoints)} endpoints, {http_config.check_interval}s)")
+            if db_config.enabled:
+                sources.append(f"Database ({len(db_config.databases)} databases, {db_config.check_interval}s)")
+            if log_config.enabled:
+                sources.append(f"Log ({len(log_config.logs)} files, {log_config.check_interval}s)")
             if sources:
                 logging.info(f"Enabled monitoring sources: {', '.join(sources)}")
 
@@ -419,6 +434,8 @@ class EmailMonitorDaemon:
                         rss_config = RssFeedConfig.from_config(self.config)
                         web_config = WebMonitorConfig.from_config(self.config)
                         http_config = HttpEndpointConfig.from_config(self.config)
+                        db_config = DatabaseMonitorConfig.from_config(self.config)
+                        log_config = LogMonitorConfig.from_config(self.config)
                     logging.info("Monitoring source configs refreshed after reload")
                     _log_enabled_sources()
 
@@ -627,6 +644,38 @@ class EmailMonitorDaemon:
                         self._dispatch_notification(notification)
                     next_run_times['http'] = current_time + http_config.check_interval
 
+                # =====================================================
+                # Check Databases (respecting per-source check_interval)
+                # =====================================================
+                if db_config.enabled and current_time >= next_run_times['database']:
+                    db_events = check_databases(db_config, monitor_state)
+                    for event in db_events:
+                        if self.stop_event.is_set():
+                            break
+                        if event.severity in ('error', 'critical'):
+                            logging.warning(f"[Database] {event.title}")
+                        else:
+                            logging.info(f"[Database] {event.title}")
+                        notification = event.to_email_notification()
+                        self._dispatch_notification(notification)
+                    next_run_times['database'] = current_time + db_config.check_interval
+
+                # =====================================================
+                # Check Log Files (respecting per-source check_interval)
+                # =====================================================
+                if log_config.enabled and current_time >= next_run_times['log']:
+                    log_events = check_log_files(log_config, monitor_state)
+                    for event in log_events:
+                        if self.stop_event.is_set():
+                            break
+                        if event.severity in ('error', 'critical'):
+                            logging.warning(f"[Log] {event.title}")
+                        else:
+                            logging.info(f"[Log] {event.title}")
+                        notification = event.to_email_notification()
+                        self._dispatch_notification(notification)
+                    next_run_times['log'] = current_time + log_config.check_interval
+
                 # Save monitoring state
                 monitor_state.save()
 
@@ -659,6 +708,10 @@ class EmailMonitorDaemon:
                         pending_intervals.append(max(0, next_run_times['web'] - current_time))
                     if http_config.enabled:
                         pending_intervals.append(max(0, next_run_times['http'] - current_time))
+                    if db_config.enabled:
+                        pending_intervals.append(max(0, next_run_times['database'] - current_time))
+                    if log_config.enabled:
+                        pending_intervals.append(max(0, next_run_times['log'] - current_time))
 
                     # Sleep until the next source needs to run (minimum 1 second)
                     sleep_time = max(1, min(pending_intervals)) if pending_intervals else check_interval
@@ -1072,12 +1125,18 @@ def test_configuration(config_file: str) -> bool:
         ('RSS Feeds', 'RSS', 'enabled'),
         ('Web Pages', 'WebMonitor', 'enabled'),
         ('HTTP Endpoints', 'HttpMonitor', 'enabled'),
+        ('Database Monitor', 'DatabaseMonitor', 'enabled'),
+        ('Log Monitor', 'LogMonitor', 'enabled'),
     ]
 
     for name, section, key in sources:
         enabled = daemon.config.getboolean(section, key, fallback=False)
         status = "ENABLED" if enabled else "disabled"
         print(f"  {name}: {status}")
+
+    # Show message templates status
+    templates_enabled = daemon.config.getboolean('MessageTemplates', 'enabled', fallback=False)
+    print(f"\nMessage Templates: {'ENABLED' if templates_enabled else 'disabled'}")
 
     print("\n" + "-" * 50)
     print("Configuration test PASSED")
