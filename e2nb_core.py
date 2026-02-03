@@ -460,6 +460,153 @@ class NtfyConfig:
 
 
 @dataclass
+class MessageTemplateConfig:
+    """
+    Message templating configuration for customizing notification messages.
+
+    Supports variable substitution in messages using {variable} syntax.
+
+    Available variables:
+    - {source_type}: Monitor type (email, rss, web, http, database, log)
+    - {source_name}: Source identifier/name
+    - {title}: Event title/subject
+    - {body}: Event body/content
+    - {timestamp}: Event timestamp (ISO format)
+    - {severity}: Event severity (info, warning, error, critical)
+    - {url}: Source URL (if available)
+    - {hostname}: Current hostname
+    - {date}: Current date (YYYY-MM-DD)
+    - {time}: Current time (HH:MM:SS)
+
+    Example template:
+    "[{severity}] {source_type}: {title}"
+    """
+    enabled: bool = False
+    # Default templates (used if channel-specific not defined)
+    default_subject: str = "[{severity}] {source_type}: {title}"
+    default_body: str = "{body}"
+    # Channel-specific templates (JSON format)
+    channel_templates: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    # Custom variables (JSON format)
+    custom_variables: Dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_config(cls, config: configparser.ConfigParser) -> 'MessageTemplateConfig':
+        """Create MessageTemplateConfig from ConfigParser."""
+        if 'MessageTemplates' not in config:
+            return cls()
+        section = config['MessageTemplates']
+
+        # Parse channel-specific templates
+        channel_templates = {}
+        channels_str = section.get('channel_templates', '{}')
+        try:
+            parsed = json.loads(channels_str)
+            if isinstance(parsed, dict):
+                channel_templates = parsed
+        except json.JSONDecodeError as e:
+            if channels_str.strip() not in ('{}', ''):
+                logger.error(f"Failed to parse channel_templates JSON: {e}")
+
+        # Parse custom variables
+        custom_variables = {}
+        custom_str = section.get('custom_variables', '{}')
+        try:
+            parsed = json.loads(custom_str)
+            if isinstance(parsed, dict):
+                custom_variables = parsed
+        except json.JSONDecodeError as e:
+            if custom_str.strip() not in ('{}', ''):
+                logger.error(f"Failed to parse custom_variables JSON: {e}")
+
+        return cls(
+            enabled=section.getboolean('enabled', fallback=False),
+            default_subject=section.get('default_subject', '[{severity}] {source_type}: {title}'),
+            default_body=section.get('default_body', '{body}'),
+            channel_templates=channel_templates,
+            custom_variables=custom_variables,
+        )
+
+    def render(
+        self,
+        template: str,
+        source_type: str = "email",
+        source_name: str = "",
+        title: str = "",
+        body: str = "",
+        timestamp: Optional[datetime] = None,
+        severity: str = "info",
+        url: str = "",
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Render a template string with variable substitution.
+
+        Args:
+            template: Template string with {variable} placeholders.
+            source_type: Monitor type.
+            source_name: Source identifier.
+            title: Event title.
+            body: Event body.
+            timestamp: Event timestamp.
+            severity: Event severity.
+            url: Source URL.
+            metadata: Additional metadata dict.
+
+        Returns:
+            Rendered string with variables substituted.
+        """
+        import socket
+        ts = timestamp or datetime.now()
+
+        # Build variables dict
+        variables = {
+            'source_type': source_type,
+            'source_name': source_name,
+            'title': title,
+            'body': body,
+            'timestamp': ts.isoformat(),
+            'severity': severity,
+            'url': url or '',
+            'hostname': socket.gethostname(),
+            'date': ts.strftime('%Y-%m-%d'),
+            'time': ts.strftime('%H:%M:%S'),
+        }
+
+        # Add custom variables
+        variables.update(self.custom_variables)
+
+        # Add metadata fields
+        if metadata:
+            for key, value in metadata.items():
+                if key not in variables:
+                    variables[f'meta_{key}'] = str(value) if not isinstance(value, (str, bytes)) else str(value)
+
+        # Perform substitution using safe_substitute to avoid KeyError on unknown vars
+        try:
+            # Use simple string replacement to handle {var} syntax
+            result = template
+            for key, value in variables.items():
+                result = result.replace('{' + key + '}', str(value))
+            return result
+        except Exception as e:
+            logger.warning(f"Template rendering error: {e}")
+            return template
+
+    def get_subject(self, channel: str = "") -> str:
+        """Get subject template for a channel (or default)."""
+        if channel and channel in self.channel_templates:
+            return self.channel_templates[channel].get('subject', self.default_subject)
+        return self.default_subject
+
+    def get_body(self, channel: str = "") -> str:
+        """Get body template for a channel (or default)."""
+        if channel and channel in self.channel_templates:
+            return self.channel_templates[channel].get('body', self.default_body)
+        return self.default_body
+
+
+@dataclass
 class NotificationRule:
     """A single notification routing rule with conditions."""
     name: str = ""
@@ -853,6 +1000,247 @@ class HttpEndpointConfig:
             check_interval=safe_int(main_section.get('check_interval') if main_section else None, 60, min_val=10, max_val=86400),
             notify_on_first_check=main_section.get('notify_on_first_check', 'false').lower() == 'true' if isinstance(main_section, dict) else main_section.getboolean('notify_on_first_check', fallback=False),
             default_failure_threshold=safe_int(main_section.get('default_failure_threshold') if main_section else None, 1, min_val=1, max_val=100)
+        )
+
+
+@dataclass
+class DatabaseMonitorConfig:
+    """
+    Database monitoring configuration.
+
+    Supports multiple database types and monitoring modes:
+    - Connection health checks (is the database reachable?)
+    - Query result monitoring (check specific values or counts)
+    - Query timing thresholds (alert if queries are slow)
+
+    Supported databases:
+    - PostgreSQL (requires psycopg2)
+    - MySQL/MariaDB (requires mysql-connector-python)
+    - SQLite (built-in)
+
+    Configuration formats:
+    1. JSON array in [DatabaseMonitor] section:
+       databases = [{"name": "mydb", "type": "postgresql", "host": "localhost", ...}]
+
+    2. Individual sections:
+       [DatabaseMonitor.mydb]
+       type = postgresql
+       host = localhost
+       port = 5432
+       database = myapp
+       username = admin
+       password = secret
+       query = SELECT COUNT(*) FROM users WHERE active = true
+       expected_value = >100
+       timeout = 30
+    """
+    enabled: bool = False
+    databases: List[Dict[str, Any]] = field(default_factory=list)
+    check_interval: int = 300  # 5 minutes default
+    notify_on_first_check: bool = False
+    default_timeout: int = 30
+
+    @classmethod
+    def from_config(cls, config: configparser.ConfigParser) -> 'DatabaseMonitorConfig':
+        """Create DatabaseMonitorConfig from ConfigParser."""
+        databases = []
+
+        # Method 1: Parse from JSON string in [DatabaseMonitor] section
+        if 'DatabaseMonitor' in config:
+            section = config['DatabaseMonitor']
+            databases_str = section.get('databases', '[]')
+            try:
+                parsed = json.loads(databases_str)
+                if isinstance(parsed, list):
+                    for db in parsed:
+                        if isinstance(db, dict) and 'type' in db:
+                            databases.append(db)
+                        elif db:
+                            logger.warning(f"Invalid database entry (missing 'type'): {db}")
+                elif databases_str.strip() not in ('[]', ''):
+                    logger.warning("DatabaseMonitor databases config must be a JSON array")
+            except json.JSONDecodeError as e:
+                if databases_str.strip() not in ('[]', ''):
+                    logger.error(f"Failed to parse DatabaseMonitor databases JSON: {e}")
+
+        # Method 2: Parse individual [DatabaseMonitor.name] sections
+        for section_name in config.sections():
+            if section_name.startswith('DatabaseMonitor.'):
+                db_name = section_name[len('DatabaseMonitor.'):]
+                section = config[section_name]
+                db_type = section.get('type', '').lower()
+
+                if not db_type:
+                    logger.warning(f"Section [{section_name}] missing 'type' - skipping")
+                    continue
+
+                db_config = {
+                    'name': section.get('name', db_name),
+                    'type': db_type,
+                }
+
+                # Connection settings
+                if db_type in ('postgresql', 'postgres', 'mysql', 'mariadb'):
+                    db_config['host'] = section.get('host', 'localhost')
+                    db_config['port'] = safe_int(section.get('port'),
+                                                  5432 if db_type in ('postgresql', 'postgres') else 3306,
+                                                  min_val=1, max_val=65535)
+                    db_config['database'] = section.get('database', '')
+                    db_config['username'] = section.get('username', '')
+                    db_config['password'] = section.get('password', '')
+                elif db_type == 'sqlite':
+                    db_config['path'] = section.get('path', '')
+
+                # Query settings
+                if section.get('query'):
+                    db_config['query'] = section.get('query')
+                if section.get('expected_value'):
+                    db_config['expected_value'] = section.get('expected_value')
+                if section.get('expected_rows'):
+                    db_config['expected_rows'] = section.get('expected_rows')
+                if section.get('timeout'):
+                    db_config['timeout'] = safe_int(section.get('timeout'), 30, min_val=1, max_val=300)
+                if section.get('failure_threshold'):
+                    db_config['failure_threshold'] = safe_int(section.get('failure_threshold'), 1, min_val=1, max_val=100)
+                if section.get('slow_query_threshold'):
+                    db_config['slow_query_threshold'] = float(section.get('slow_query_threshold', '5.0'))
+
+                # SSL settings for PostgreSQL/MySQL
+                if section.get('ssl_mode'):
+                    db_config['ssl_mode'] = section.get('ssl_mode')
+                if section.get('ssl_ca'):
+                    db_config['ssl_ca'] = section.get('ssl_ca')
+
+                databases.append(db_config)
+                logger.debug(f"Loaded database monitor: {db_config['name']} ({db_type})")
+
+        main_section = config['DatabaseMonitor'] if 'DatabaseMonitor' in config else {}
+        return cls(
+            enabled=main_section.get('enabled', 'false').lower() == 'true' if isinstance(main_section, dict) else main_section.getboolean('enabled', fallback=False),
+            databases=databases,
+            check_interval=safe_int(main_section.get('check_interval') if main_section else None, 300, min_val=30, max_val=86400),
+            notify_on_first_check=main_section.get('notify_on_first_check', 'false').lower() == 'true' if isinstance(main_section, dict) else main_section.getboolean('notify_on_first_check', fallback=False),
+            default_timeout=safe_int(main_section.get('default_timeout') if main_section else None, 30, min_val=1, max_val=300)
+        )
+
+
+@dataclass
+class LogMonitorConfig:
+    """
+    Log file monitoring configuration.
+
+    Monitors log files for specific patterns and generates alerts.
+
+    Features:
+    - Multiple log file monitoring
+    - Regex pattern matching
+    - Severity detection from log content
+    - Rate limiting to prevent notification floods
+    - File rotation handling
+
+    Configuration formats:
+    1. JSON array in [LogMonitor] section:
+       logs = [{"name": "app", "path": "/var/log/app.log", "patterns": ["ERROR", "CRITICAL"]}]
+
+    2. Individual sections:
+       [LogMonitor.app_errors]
+       path = /var/log/app.log
+       patterns = ["ERROR", "CRITICAL", "Exception"]
+       severity_patterns = {"error": "ERROR|EXCEPTION", "critical": "CRITICAL|FATAL"}
+       max_lines_per_check = 100
+       rate_limit = 10
+    """
+    enabled: bool = False
+    logs: List[Dict[str, Any]] = field(default_factory=list)
+    check_interval: int = 60  # 1 minute default
+    max_lines_per_check: int = 1000
+    default_rate_limit: int = 10  # Max alerts per log per check
+
+    @classmethod
+    def from_config(cls, config: configparser.ConfigParser) -> 'LogMonitorConfig':
+        """Create LogMonitorConfig from ConfigParser."""
+        logs = []
+
+        # Method 1: Parse from JSON string in [LogMonitor] section
+        if 'LogMonitor' in config:
+            section = config['LogMonitor']
+            logs_str = section.get('logs', '[]')
+            try:
+                parsed = json.loads(logs_str)
+                if isinstance(parsed, list):
+                    for log in parsed:
+                        if isinstance(log, dict) and 'path' in log:
+                            logs.append(log)
+                        elif log:
+                            logger.warning(f"Invalid log entry (missing 'path'): {log}")
+                elif logs_str.strip() not in ('[]', ''):
+                    logger.warning("LogMonitor logs config must be a JSON array")
+            except json.JSONDecodeError as e:
+                if logs_str.strip() not in ('[]', ''):
+                    logger.error(f"Failed to parse LogMonitor logs JSON: {e}")
+
+        # Method 2: Parse individual [LogMonitor.name] sections
+        for section_name in config.sections():
+            if section_name.startswith('LogMonitor.'):
+                log_name = section_name[len('LogMonitor.'):]
+                section = config[section_name]
+                log_path = section.get('path', '').strip()
+
+                if not log_path:
+                    logger.warning(f"Section [{section_name}] missing 'path' - skipping")
+                    continue
+
+                log_config = {
+                    'name': section.get('name', log_name),
+                    'path': log_path,
+                }
+
+                # Parse patterns (can be JSON array or comma-separated)
+                patterns_str = section.get('patterns', '')
+                if patterns_str:
+                    try:
+                        patterns = json.loads(patterns_str)
+                        if isinstance(patterns, list):
+                            log_config['patterns'] = patterns
+                    except json.JSONDecodeError:
+                        # Try comma-separated format
+                        log_config['patterns'] = [p.strip() for p in patterns_str.split(',') if p.strip()]
+
+                # Parse severity patterns (JSON dict mapping severity to regex)
+                severity_str = section.get('severity_patterns', '')
+                if severity_str:
+                    try:
+                        severity_patterns = json.loads(severity_str)
+                        if isinstance(severity_patterns, dict):
+                            log_config['severity_patterns'] = severity_patterns
+                    except json.JSONDecodeError:
+                        logger.warning(f"Invalid severity_patterns JSON in [{section_name}]")
+
+                # Optional settings
+                if section.get('max_lines_per_check'):
+                    log_config['max_lines_per_check'] = safe_int(section.get('max_lines_per_check'), 1000, min_val=1, max_val=10000)
+                if section.get('rate_limit'):
+                    log_config['rate_limit'] = safe_int(section.get('rate_limit'), 10, min_val=1, max_val=1000)
+                if section.get('multiline_pattern'):
+                    log_config['multiline_pattern'] = section.get('multiline_pattern')
+                if section.get('exclude_patterns'):
+                    try:
+                        exclude = json.loads(section.get('exclude_patterns'))
+                        if isinstance(exclude, list):
+                            log_config['exclude_patterns'] = exclude
+                    except json.JSONDecodeError:
+                        log_config['exclude_patterns'] = [p.strip() for p in section.get('exclude_patterns').split(',') if p.strip()]
+
+                logs.append(log_config)
+                logger.debug(f"Loaded log monitor: {log_config['name']} -> {log_path}")
+
+        main_section = config['LogMonitor'] if 'LogMonitor' in config else {}
+        return cls(
+            enabled=main_section.get('enabled', 'false').lower() == 'true' if isinstance(main_section, dict) else main_section.getboolean('enabled', fallback=False),
+            logs=logs,
+            check_interval=safe_int(main_section.get('check_interval') if main_section else None, 60, min_val=10, max_val=86400),
+            max_lines_per_check=safe_int(main_section.get('max_lines_per_check') if main_section else None, 1000, min_val=1, max_val=10000),
+            default_rate_limit=safe_int(main_section.get('default_rate_limit') if main_section else None, 10, min_val=1, max_val=1000)
         )
 
 
@@ -1338,6 +1726,59 @@ def create_default_config(config_file: str = CONFIG_FILE_PATH) -> None:
     #     "suppress": true
     #   }
     # ]
+
+    # Message templating for customizing notification content
+    config['MessageTemplates'] = {
+        'enabled': 'False',
+        'default_subject': '[{severity}] {source_type}: {title}',
+        'default_body': '{body}',
+        'channel_templates': '{}',
+        'custom_variables': '{}'
+    }
+    # Example channel_templates JSON:
+    # {
+    #   "slack": {"subject": ":bell: {title}", "body": "*Source:* {source_name}\n{body}"},
+    #   "sms": {"subject": "{title}", "body": "{body}"}
+    # }
+    # Available variables: {source_type}, {source_name}, {title}, {body},
+    # {timestamp}, {severity}, {url}, {hostname}, {date}, {time}
+
+    # Database monitoring - monitors database health and query results
+    config['DatabaseMonitor'] = {
+        'enabled': 'False',
+        'databases': '[]',
+        'check_interval': '300',
+        'notify_on_first_check': 'False',
+        'default_timeout': '30'
+    }
+    # Example section-based config (add to config.ini):
+    # [DatabaseMonitor.main_db]
+    # type = postgresql
+    # host = localhost
+    # port = 5432
+    # database = myapp
+    # username = admin
+    # password = secret
+    # query = SELECT COUNT(*) FROM active_users
+    # expected_value = >0
+    # timeout = 30
+    # slow_query_threshold = 5.0
+
+    # Log file monitoring - monitors logs for patterns/errors
+    config['LogMonitor'] = {
+        'enabled': 'False',
+        'logs': '[]',
+        'check_interval': '60',
+        'max_lines_per_check': '1000',
+        'default_rate_limit': '10'
+    }
+    # Example section-based config (add to config.ini):
+    # [LogMonitor.app_errors]
+    # path = /var/log/myapp/error.log
+    # patterns = ["ERROR", "CRITICAL", "Exception"]
+    # severity_patterns = {"error": "ERROR|EXCEPTION", "critical": "CRITICAL|FATAL"}
+    # exclude_patterns = ["DEBUG", "healthcheck"]
+    # rate_limit = 5
 
     with open(config_file, 'w') as file:
         config.write(file)
@@ -3030,6 +3471,7 @@ class NotificationDispatcher:
         self.webhook = WebhookConfig.from_config(config)
         self.smtp = SmtpConfig.from_config(config)
         self.notification_rules = NotificationRulesConfig.from_config(config)
+        self.message_templates = MessageTemplateConfig.from_config(config)
         self._http_session: Optional[requests.Session] = None
 
     @property
@@ -3096,6 +3538,53 @@ class NotificationDispatcher:
         if self.smtp.enabled:
             channels.append('email')
         return channels
+
+    def _apply_template(
+        self,
+        channel: str,
+        notification: EmailNotification,
+        source_type: str = "email",
+        severity: str = "info"
+    ) -> Tuple[str, str]:
+        """
+        Apply message template to notification if templating is enabled.
+
+        Args:
+            channel: Channel name for channel-specific templates.
+            notification: The notification to apply templates to.
+            source_type: Source type for template variables.
+            severity: Severity for template variables.
+
+        Returns:
+            Tuple of (subject, body) - either templated or original.
+        """
+        if not self.message_templates.enabled:
+            return notification.subject, notification.body
+
+        subject_template = self.message_templates.get_subject(channel)
+        body_template = self.message_templates.get_body(channel)
+
+        subject = self.message_templates.render(
+            template=subject_template,
+            source_type=source_type,
+            source_name=notification.sender,
+            title=notification.subject,
+            body=notification.body,
+            timestamp=notification.timestamp,
+            severity=severity,
+        )
+
+        body = self.message_templates.render(
+            template=body_template,
+            source_type=source_type,
+            source_name=notification.sender,
+            title=notification.subject,
+            body=notification.body,
+            timestamp=notification.timestamp,
+            severity=severity,
+        )
+
+        return subject, body
 
     def dispatch(
         self,
@@ -3186,11 +3675,12 @@ class NotificationDispatcher:
 
         # Slack channel message
         if self.slack.enabled and _should_send('slack'):
+            slack_subject, slack_body = self._apply_template('slack', notification, source_type, severity)
             result = send_slack_message(
                 self.slack.token,
                 self.slack.channel,
-                notification.subject,
-                notification.body,
+                slack_subject,
+                slack_body,
                 mention_users=self.slack.mention_users,
                 use_blocks=self.slack.use_blocks,
             )
@@ -3200,13 +3690,14 @@ class NotificationDispatcher:
 
         # Slack DMs to individual users
         if self.slack.enabled and self.slack.dm_users and _should_send('slack_dm'):
+            slack_dm_subject, slack_dm_body = self._apply_template('slack_dm', notification, source_type, severity)
             dm_user_ids = [u.strip() for u in self.slack.dm_users.split(',') if u.strip()]
             for user_id in dm_user_ids:
                 result = send_slack_dm(
                     self.slack.token,
                     user_id,
-                    notification.subject,
-                    notification.body,
+                    slack_dm_subject,
+                    slack_dm_body,
                     use_blocks=self.slack.use_blocks,
                 )
                 results.append(result)
@@ -3215,11 +3706,12 @@ class NotificationDispatcher:
 
         # Telegram
         if self.telegram.enabled and _should_send('telegram'):
+            telegram_subject, telegram_body = self._apply_template('telegram', notification, source_type, severity)
             result = send_telegram_message(
                 self.telegram.bot_token,
                 self.telegram.chat_id,
-                notification.subject,
-                notification.body,
+                telegram_subject,
+                telegram_body,
                 self.http_session
             )
             results.append(result)
@@ -3228,10 +3720,11 @@ class NotificationDispatcher:
 
         # Discord
         if self.discord.enabled and _should_send('discord'):
+            discord_subject, discord_body = self._apply_template('discord', notification, source_type, severity)
             result = send_discord_message(
                 self.discord.webhook_url,
-                notification.subject,
-                notification.body,
+                discord_subject,
+                discord_body,
                 self.http_session
             )
             results.append(result)
@@ -3240,10 +3733,11 @@ class NotificationDispatcher:
 
         # Microsoft Teams
         if self.teams.enabled and _should_send('teams'):
+            teams_subject, teams_body = self._apply_template('teams', notification, source_type, severity)
             result = send_teams_message(
                 self.teams.webhook_url,
-                notification.subject,
-                notification.body,
+                teams_subject,
+                teams_body,
                 self.http_session,
                 use_adaptive_card=self.teams.use_adaptive_card,
             )
@@ -3253,6 +3747,7 @@ class NotificationDispatcher:
 
         # Pushover
         if self.pushover.enabled and _should_send('pushover'):
+            pushover_subject, pushover_body = self._apply_template('pushover', notification, source_type, severity)
             # Apply priority_override from rules if present
             po_priority = self.pushover.priority
             if priority_override:
@@ -3260,8 +3755,8 @@ class NotificationDispatcher:
             result = send_pushover_notification(
                 self.pushover.api_token,
                 self.pushover.user_key,
-                notification.subject,
-                notification.body,
+                pushover_subject,
+                pushover_body,
                 priority=po_priority,
                 sound=self.pushover.sound,
                 device=self.pushover.device,
@@ -3283,11 +3778,12 @@ class NotificationDispatcher:
                     ntfy_priority = priority_override
                 elif priority_override in _ntfy_map:
                     ntfy_priority = _ntfy_map[priority_override]
+            ntfy_subject, ntfy_body = self._apply_template('ntfy', notification, source_type, severity)
             result = send_ntfy_notification(
                 self.ntfy.server_url,
                 self.ntfy.topic,
-                notification.subject,
-                notification.body,
+                ntfy_subject,
+                ntfy_body,
                 priority=ntfy_priority,
                 tags=self.ntfy.tags,
                 auth_token=self.ntfy.auth_token,
@@ -3299,11 +3795,14 @@ class NotificationDispatcher:
 
         # Custom Webhook
         if self.webhook.enabled and _should_send('webhook'):
+            webhook_subject, webhook_body = self._apply_template('webhook', notification, source_type, severity)
             payload = {
-                'subject': notification.subject,
-                'body': notification.body,
+                'subject': webhook_subject,
+                'body': webhook_body,
                 'sender': notification.sender,
-                'timestamp': notification.timestamp.isoformat()
+                'timestamp': notification.timestamp.isoformat(),
+                'source_type': source_type,
+                'severity': severity
             }
             result = send_custom_webhook(
                 self.webhook.webhook_url,
@@ -3316,6 +3815,7 @@ class NotificationDispatcher:
 
         # SMTP Email
         if self.smtp.enabled and _should_send('email'):
+            email_subject, email_body = self._apply_template('email', notification, source_type, severity)
             for to_address in self.smtp.to_addresses:
                 result = send_email_notification(
                     self.smtp.smtp_server,
@@ -3324,8 +3824,8 @@ class NotificationDispatcher:
                     self.smtp.password,
                     self.smtp.from_address,
                     to_address,
-                    notification.subject,
-                    notification.body,
+                    email_subject,
+                    email_body,
                     notification.sender,
                     self.smtp.use_tls,
                     self.smtp.subject_prefix
@@ -3442,6 +3942,9 @@ class MonitorState:
             'imap_last_uid': {},  # server:username -> last seen UID
             'web_page_hashes': {},  # page_url -> content hash
             'http_endpoint_status': {},  # endpoint_url -> last status
+            'database_status': {},  # db_name -> last status
+            'log_file_positions': {},  # log_path -> file position
+            'log_file_inodes': {},  # log_path -> inode (for rotation detection)
             'last_updated': None
         }
         self._load()
@@ -3579,6 +4082,45 @@ class MonitorState:
                 items_list = list(items)
                 self._state['seen_rss_items'][feed_url] = set(items_list[:max_items])
                 logger.debug(f"Cleaned up RSS item cache for {feed_url}: kept {max_items} of {len(items_list)} items")
+
+    # Database monitor state methods
+    def get_database_status(self, db_name: str) -> Optional[Dict[str, Any]]:
+        """Get last known status for a database."""
+        return self._state.get('database_status', {}).get(db_name)
+
+    def set_database_status(self, db_name: str, status: Dict[str, Any]):
+        """Store status for a database."""
+        if 'database_status' not in self._state:
+            self._state['database_status'] = {}
+        self._state['database_status'][db_name] = status
+
+    # Log file monitor state methods
+    def get_log_file_position(self, log_path: str) -> int:
+        """Get last read position for a log file."""
+        return self._state.get('log_file_positions', {}).get(log_path, 0)
+
+    def set_log_file_position(self, log_path: str, position: int):
+        """Store read position for a log file."""
+        if 'log_file_positions' not in self._state:
+            self._state['log_file_positions'] = {}
+        self._state['log_file_positions'][log_path] = position
+
+    def get_log_file_inode(self, log_path: str) -> Optional[int]:
+        """Get stored inode for a log file (for rotation detection)."""
+        return self._state.get('log_file_inodes', {}).get(log_path)
+
+    def set_log_file_inode(self, log_path: str, inode: int):
+        """Store inode for a log file."""
+        if 'log_file_inodes' not in self._state:
+            self._state['log_file_inodes'] = {}
+        self._state['log_file_inodes'][log_path] = inode
+
+    def reset_log_file_state(self, log_path: str):
+        """Reset state for a log file (e.g., after rotation detected)."""
+        if 'log_file_positions' in self._state and log_path in self._state['log_file_positions']:
+            del self._state['log_file_positions'][log_path]
+        if 'log_file_inodes' in self._state and log_path in self._state['log_file_inodes']:
+            del self._state['log_file_inodes'][log_path]
 
 
 # =============================================================================
@@ -4318,6 +4860,731 @@ def test_http_endpoint(
         return True, f"Endpoint OK - Status: {status_code}, Response time: {response_time:.2f}s"
     else:
         return False, f"Endpoint check failed: {error}"
+
+
+# =============================================================================
+# Database Monitoring
+# =============================================================================
+
+# Optional database driver imports with graceful fallback
+try:
+    import psycopg2
+    PSYCOPG2_AVAILABLE = True
+except ImportError:
+    PSYCOPG2_AVAILABLE = False
+    psycopg2 = None
+
+try:
+    import mysql.connector as mysql_connector
+    MYSQL_AVAILABLE = True
+except ImportError:
+    MYSQL_AVAILABLE = False
+    mysql_connector = None
+
+import sqlite3  # Built-in, always available
+
+
+def check_database_connection(
+    db_type: str,
+    host: str = "localhost",
+    port: int = 5432,
+    database: str = "",
+    username: str = "",
+    password: str = "",
+    path: str = "",  # For SQLite
+    timeout: int = 30,
+    ssl_mode: str = "",
+    ssl_ca: str = ""
+) -> Tuple[bool, float, str]:
+    """
+    Test a database connection.
+
+    Args:
+        db_type: Database type (postgresql, mysql, sqlite).
+        host: Database host.
+        port: Database port.
+        database: Database name.
+        username: Database username.
+        password: Database password.
+        path: Path to SQLite database file.
+        timeout: Connection timeout in seconds.
+        ssl_mode: SSL mode (for PostgreSQL/MySQL).
+        ssl_ca: Path to CA certificate.
+
+    Returns:
+        Tuple of (success, response_time, error_message).
+    """
+    start_time = time.time()
+
+    try:
+        if db_type in ('postgresql', 'postgres'):
+            if not PSYCOPG2_AVAILABLE:
+                return False, 0.0, "psycopg2 not installed (pip install psycopg2-binary)"
+
+            conn_params = {
+                'host': host,
+                'port': port,
+                'database': database,
+                'user': username,
+                'password': password,
+                'connect_timeout': timeout,
+            }
+            if ssl_mode:
+                conn_params['sslmode'] = ssl_mode
+            if ssl_ca:
+                conn_params['sslrootcert'] = ssl_ca
+
+            conn = psycopg2.connect(**conn_params)
+            conn.close()
+
+        elif db_type in ('mysql', 'mariadb'):
+            if not MYSQL_AVAILABLE:
+                return False, 0.0, "mysql-connector-python not installed (pip install mysql-connector-python)"
+
+            conn_params = {
+                'host': host,
+                'port': port,
+                'database': database,
+                'user': username,
+                'password': password,
+                'connection_timeout': timeout,
+            }
+            if ssl_ca:
+                conn_params['ssl_ca'] = ssl_ca
+
+            conn = mysql_connector.connect(**conn_params)
+            conn.close()
+
+        elif db_type == 'sqlite':
+            if not path:
+                return False, 0.0, "SQLite path not specified"
+            if not os.path.exists(path):
+                return False, 0.0, f"SQLite database file not found: {path}"
+
+            conn = sqlite3.connect(path, timeout=timeout)
+            conn.close()
+
+        else:
+            return False, 0.0, f"Unsupported database type: {db_type}"
+
+        response_time = time.time() - start_time
+        return True, response_time, ""
+
+    except Exception as e:
+        response_time = time.time() - start_time
+        return False, response_time, str(e)
+
+
+def execute_database_query(
+    db_type: str,
+    query: str,
+    host: str = "localhost",
+    port: int = 5432,
+    database: str = "",
+    username: str = "",
+    password: str = "",
+    path: str = "",
+    timeout: int = 30,
+    ssl_mode: str = "",
+    ssl_ca: str = ""
+) -> Tuple[bool, Any, float, str]:
+    """
+    Execute a query and return the result.
+
+    Args:
+        db_type: Database type.
+        query: SQL query to execute.
+        host: Database host.
+        port: Database port.
+        database: Database name.
+        username: Database username.
+        password: Database password.
+        path: Path to SQLite database file.
+        timeout: Connection timeout.
+        ssl_mode: SSL mode.
+        ssl_ca: Path to CA certificate.
+
+    Returns:
+        Tuple of (success, result, response_time, error_message).
+    """
+    start_time = time.time()
+
+    try:
+        conn = None
+        cursor = None
+
+        if db_type in ('postgresql', 'postgres'):
+            if not PSYCOPG2_AVAILABLE:
+                return False, None, 0.0, "psycopg2 not installed"
+
+            conn_params = {
+                'host': host, 'port': port, 'database': database,
+                'user': username, 'password': password, 'connect_timeout': timeout,
+            }
+            if ssl_mode:
+                conn_params['sslmode'] = ssl_mode
+            if ssl_ca:
+                conn_params['sslrootcert'] = ssl_ca
+
+            conn = psycopg2.connect(**conn_params)
+            cursor = conn.cursor()
+            cursor.execute(query)
+
+        elif db_type in ('mysql', 'mariadb'):
+            if not MYSQL_AVAILABLE:
+                return False, None, 0.0, "mysql-connector-python not installed"
+
+            conn_params = {
+                'host': host, 'port': port, 'database': database,
+                'user': username, 'password': password, 'connection_timeout': timeout,
+            }
+            if ssl_ca:
+                conn_params['ssl_ca'] = ssl_ca
+
+            conn = mysql_connector.connect(**conn_params)
+            cursor = conn.cursor()
+            cursor.execute(query)
+
+        elif db_type == 'sqlite':
+            if not path:
+                return False, None, 0.0, "SQLite path not specified"
+            conn = sqlite3.connect(path, timeout=timeout)
+            cursor = conn.cursor()
+            cursor.execute(query)
+
+        else:
+            return False, None, 0.0, f"Unsupported database type: {db_type}"
+
+        # Fetch results
+        result = cursor.fetchall()
+        response_time = time.time() - start_time
+
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+        return True, result, response_time, ""
+
+    except Exception as e:
+        response_time = time.time() - start_time
+        return False, None, response_time, str(e)
+
+
+def evaluate_expected_value(result: Any, expected: str) -> Tuple[bool, str]:
+    """
+    Evaluate if a query result matches the expected value.
+
+    Supports comparison operators: =, ==, !=, <>, <, <=, >, >=
+    For single-value results (e.g., COUNT(*)), extracts the first value.
+
+    Args:
+        result: Query result (list of tuples).
+        expected: Expected value expression (e.g., ">100", "=5", "some_text").
+
+    Returns:
+        Tuple of (matches, description).
+    """
+    # Handle empty result
+    if not result:
+        if expected.lower() in ('none', 'null', 'empty', '0'):
+            return True, "Result is empty (expected)"
+        return False, f"Result is empty, expected {expected}"
+
+    # Extract scalar value if result is single row/column
+    actual = result
+    if isinstance(result, list) and len(result) == 1:
+        if isinstance(result[0], (list, tuple)) and len(result[0]) == 1:
+            actual = result[0][0]
+        else:
+            actual = result[0]
+
+    # Parse expected value for comparison operators
+    expected_str = str(expected).strip()
+    operators = ['>=', '<=', '!=', '<>', '==', '=', '>', '<']
+    op = None
+    expected_val = expected_str
+
+    for o in operators:
+        if expected_str.startswith(o):
+            op = o
+            expected_val = expected_str[len(o):].strip()
+            break
+
+    # Try numeric comparison
+    try:
+        actual_num = float(actual) if actual is not None else 0
+        expected_num = float(expected_val)
+
+        if op in ('=', '==') or op is None:
+            matches = actual_num == expected_num
+        elif op in ('!=', '<>'):
+            matches = actual_num != expected_num
+        elif op == '<':
+            matches = actual_num < expected_num
+        elif op == '<=':
+            matches = actual_num <= expected_num
+        elif op == '>':
+            matches = actual_num > expected_num
+        elif op == '>=':
+            matches = actual_num >= expected_num
+        else:
+            matches = actual_num == expected_num
+
+        return matches, f"Actual: {actual}, Expected: {expected}"
+
+    except (ValueError, TypeError):
+        # Fall back to string comparison
+        actual_str = str(actual) if actual is not None else ''
+        if op in ('=', '==') or op is None:
+            matches = actual_str == expected_val
+        elif op in ('!=', '<>'):
+            matches = actual_str != expected_val
+        else:
+            matches = actual_str == expected_val
+
+        return matches, f"Actual: '{actual_str}', Expected: '{expected_val}'"
+
+
+def check_databases(
+    config: DatabaseMonitorConfig,
+    state: MonitorState
+) -> List[MonitorEvent]:
+    """
+    Check all configured databases.
+
+    Args:
+        config: Database monitor configuration.
+        state: Monitor state for tracking database status.
+
+    Returns:
+        List of MonitorEvent objects for status changes.
+    """
+    if not config.enabled or not config.databases:
+        return []
+
+    events = []
+
+    for db_config in config.databases:
+        db_name = db_config.get('name', 'unknown')
+        db_type = db_config.get('type', '').lower()
+        timeout = db_config.get('timeout', config.default_timeout)
+        failure_threshold = db_config.get('failure_threshold', 1)
+        slow_query_threshold = db_config.get('slow_query_threshold', 5.0)
+        query = db_config.get('query')
+        expected_value = db_config.get('expected_value')
+        expected_rows = db_config.get('expected_rows')
+
+        # Get connection parameters
+        host = db_config.get('host', 'localhost')
+        port = db_config.get('port', 5432 if db_type in ('postgresql', 'postgres') else 3306)
+        database = db_config.get('database', '')
+        username = db_config.get('username', '')
+        password = db_config.get('password', '')
+        path = db_config.get('path', '')  # SQLite
+        ssl_mode = db_config.get('ssl_mode', '')
+        ssl_ca = db_config.get('ssl_ca', '')
+
+        # Get previous status
+        state_key = f"db:{db_name}"
+        last_status = state.get_database_status(state_key)
+        was_ok = last_status.get('ok', True) if last_status else True
+        consecutive_failures = last_status.get('consecutive_failures', 0) if last_status else 0
+        is_first_check = last_status is None
+
+        # Perform check
+        success = False
+        error = ""
+        response_time = 0.0
+        result_info = ""
+
+        if query:
+            # Execute query and validate result
+            success, result, response_time, error = execute_database_query(
+                db_type=db_type, query=query,
+                host=host, port=port, database=database,
+                username=username, password=password, path=path,
+                timeout=timeout, ssl_mode=ssl_mode, ssl_ca=ssl_ca
+            )
+
+            if success:
+                # Check expected value
+                if expected_value:
+                    matches, desc = evaluate_expected_value(result, expected_value)
+                    if not matches:
+                        success = False
+                        error = f"Query result mismatch: {desc}"
+                    else:
+                        result_info = desc
+
+                # Check expected row count
+                if expected_rows and success:
+                    try:
+                        row_count = len(result) if result else 0
+                        exp_matches, exp_desc = evaluate_expected_value([[row_count]], expected_rows)
+                        if not exp_matches:
+                            success = False
+                            error = f"Row count mismatch: got {row_count}, expected {expected_rows}"
+                        else:
+                            result_info = f"Rows: {row_count}"
+                    except Exception:
+                        pass
+
+                # Check for slow query
+                if success and response_time > slow_query_threshold:
+                    # Generate warning event for slow query
+                    event = MonitorEvent(
+                        source_type='database',
+                        source_name=db_name,
+                        title=f"Slow Query: {db_name}",
+                        body=f"Query took {response_time:.2f}s (threshold: {slow_query_threshold}s)",
+                        severity='warning',
+                        metadata={
+                            'id': f"slow-{datetime.now().isoformat()}".encode(),
+                            'db_type': db_type,
+                            'response_time': response_time
+                        }
+                    )
+                    events.append(event)
+                    logger.warning(f"Database '{db_name}' slow query: {response_time:.2f}s")
+
+        else:
+            # Just check connection
+            success, response_time, error = check_database_connection(
+                db_type=db_type,
+                host=host, port=port, database=database,
+                username=username, password=password, path=path,
+                timeout=timeout, ssl_mode=ssl_mode, ssl_ca=ssl_ca
+            )
+
+        # Handle first-check notification
+        if is_first_check and config.notify_on_first_check:
+            if success:
+                event = MonitorEvent(
+                    source_type='database',
+                    source_name=db_name,
+                    title=f"Monitoring Started: {db_name}",
+                    body=f"Database monitoring active. Response time: {response_time:.2f}s",
+                    severity='info',
+                    metadata={
+                        'id': f"start-{datetime.now().isoformat()}".encode(),
+                        'db_type': db_type,
+                        'response_time': response_time
+                    }
+                )
+                events.append(event)
+                logger.info(f"Database '{db_name}' monitoring started (OK)")
+            else:
+                event = MonitorEvent(
+                    source_type='database',
+                    source_name=db_name,
+                    title=f"Monitoring Started (Warning): {db_name}",
+                    body=f"Database monitoring started but check failed: {error}",
+                    severity='warning',
+                    metadata={
+                        'id': f"start-warning-{datetime.now().isoformat()}".encode(),
+                        'db_type': db_type,
+                        'error': error
+                    }
+                )
+                events.append(event)
+                logger.warning(f"Database '{db_name}' monitoring started with warning: {error}")
+
+        # Track failures and detect status changes
+        elif success and not was_ok:
+            # Recovered from failure
+            event = MonitorEvent(
+                source_type='database',
+                source_name=db_name,
+                title=f"Database Recovered: {db_name}",
+                body=f"Database is back online after {consecutive_failures} failed check(s). Response time: {response_time:.2f}s",
+                severity='info',
+                metadata={
+                    'id': f"recovery-{datetime.now().isoformat()}".encode(),
+                    'db_type': db_type,
+                    'response_time': response_time,
+                    'previous_failures': consecutive_failures
+                }
+            )
+            events.append(event)
+            consecutive_failures = 0
+            logger.info(f"Database '{db_name}' recovered")
+
+        elif not success:
+            consecutive_failures += 1
+
+            if consecutive_failures == failure_threshold:
+                severity = 'error' if failure_threshold == 1 else 'warning'
+                event = MonitorEvent(
+                    source_type='database',
+                    source_name=db_name,
+                    title=f"Database Down: {db_name}",
+                    body=f"Database check failed ({consecutive_failures} consecutive failure(s)): {error}",
+                    severity=severity,
+                    metadata={
+                        'id': f"failure-{datetime.now().isoformat()}".encode(),
+                        'db_type': db_type,
+                        'error': error,
+                        'consecutive_failures': consecutive_failures
+                    }
+                )
+                events.append(event)
+                logger.warning(f"Database '{db_name}' down (threshold {failure_threshold} met): {error}")
+
+            elif consecutive_failures < failure_threshold:
+                logger.debug(f"Database '{db_name}' failed ({consecutive_failures}/{failure_threshold}): {error}")
+
+        else:
+            consecutive_failures = 0
+
+        # Update state
+        state.set_database_status(state_key, {
+            'ok': success,
+            'response_time': response_time,
+            'error': error if not success else None,
+            'result_info': result_info if success else None,
+            'consecutive_failures': consecutive_failures,
+            'last_check': datetime.now().isoformat()
+        })
+
+    return events
+
+
+def test_database_connection(
+    db_type: str,
+    host: str = "localhost",
+    port: int = 5432,
+    database: str = "",
+    username: str = "",
+    password: str = "",
+    path: str = "",
+    timeout: int = 30
+) -> Tuple[bool, str]:
+    """
+    Test a database connection (for configuration validation).
+
+    Returns:
+        Tuple of (success, message).
+    """
+    success, response_time, error = check_database_connection(
+        db_type=db_type, host=host, port=port, database=database,
+        username=username, password=password, path=path, timeout=timeout
+    )
+
+    if success:
+        return True, f"Connection OK - Response time: {response_time:.2f}s"
+    else:
+        return False, f"Connection failed: {error}"
+
+
+# =============================================================================
+# Log File Monitoring
+# =============================================================================
+
+def check_log_files(
+    config: LogMonitorConfig,
+    state: MonitorState
+) -> List[MonitorEvent]:
+    """
+    Check log files for matching patterns.
+
+    Features:
+    - Tracks file position to only read new lines
+    - Detects log rotation via inode changes
+    - Supports multiple patterns per log file
+    - Rate limiting to prevent notification floods
+
+    Args:
+        config: Log monitor configuration.
+        state: Monitor state for tracking file positions.
+
+    Returns:
+        List of MonitorEvent objects for matched patterns.
+    """
+    if not config.enabled or not config.logs:
+        return []
+
+    events = []
+
+    for log_config in config.logs:
+        log_name = log_config.get('name', 'unknown')
+        log_path = log_config.get('path', '')
+        patterns = log_config.get('patterns', [])
+        severity_patterns = log_config.get('severity_patterns', {})
+        exclude_patterns = log_config.get('exclude_patterns', [])
+        max_lines = log_config.get('max_lines_per_check', config.max_lines_per_check)
+        rate_limit = log_config.get('rate_limit', config.default_rate_limit)
+
+        if not log_path or not os.path.exists(log_path):
+            logger.debug(f"Log file not found: {log_path}")
+            continue
+
+        if not patterns:
+            logger.warning(f"No patterns configured for log '{log_name}'")
+            continue
+
+        try:
+            # Get current file stats
+            file_stat = os.stat(log_path)
+            current_inode = file_stat.st_ino
+            current_size = file_stat.st_size
+
+            # Check for log rotation (inode changed)
+            stored_inode = state.get_log_file_inode(log_path)
+            if stored_inode is not None and stored_inode != current_inode:
+                logger.info(f"Log rotation detected for '{log_name}', resetting position")
+                state.reset_log_file_state(log_path)
+
+            # Get last read position
+            last_position = state.get_log_file_position(log_path)
+
+            # Handle file truncation (size smaller than last position)
+            if current_size < last_position:
+                logger.info(f"Log file '{log_name}' truncated, resetting position")
+                last_position = 0
+
+            # Read new content
+            with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+                f.seek(last_position)
+                lines = []
+                bytes_read = 0
+
+                for _ in range(max_lines):
+                    line = f.readline()
+                    if not line:
+                        break
+                    lines.append(line.rstrip('\n\r'))
+                    bytes_read += len(line.encode('utf-8'))
+
+                new_position = last_position + bytes_read
+
+            # Compile patterns
+            compiled_patterns = []
+            for pattern in patterns:
+                try:
+                    compiled_patterns.append((pattern, re.compile(pattern, re.IGNORECASE)))
+                except re.error as e:
+                    logger.warning(f"Invalid pattern '{pattern}' in log '{log_name}': {e}")
+
+            compiled_excludes = []
+            for pattern in exclude_patterns:
+                try:
+                    compiled_excludes.append(re.compile(pattern, re.IGNORECASE))
+                except re.error:
+                    pass
+
+            compiled_severity = {}
+            for sev, pattern in severity_patterns.items():
+                try:
+                    compiled_severity[sev] = re.compile(pattern, re.IGNORECASE)
+                except re.error:
+                    pass
+
+            # Process lines
+            matches_found = 0
+            for line in lines:
+                if matches_found >= rate_limit:
+                    logger.debug(f"Rate limit reached for log '{log_name}'")
+                    break
+
+                # Check exclude patterns
+                if any(exc.search(line) for exc in compiled_excludes):
+                    continue
+
+                # Check match patterns
+                for pattern_str, pattern_re in compiled_patterns:
+                    if pattern_re.search(line):
+                        # Determine severity
+                        severity = 'info'
+                        for sev, sev_re in compiled_severity.items():
+                            if sev_re.search(line):
+                                severity = sev
+                                break
+
+                        # Try to detect severity from common log patterns
+                        if severity == 'info':
+                            line_upper = line.upper()
+                            if 'CRITICAL' in line_upper or 'FATAL' in line_upper:
+                                severity = 'critical'
+                            elif 'ERROR' in line_upper or 'EXCEPTION' in line_upper:
+                                severity = 'error'
+                            elif 'WARNING' in line_upper or 'WARN' in line_upper:
+                                severity = 'warning'
+
+                        # Create event
+                        event = MonitorEvent(
+                            source_type='log',
+                            source_name=log_name,
+                            title=f"Log Match: {log_name}",
+                            body=line[:1000] if len(line) > 1000 else line,
+                            severity=severity,
+                            metadata={
+                                'id': hashlib.md5(f"{log_path}{line}".encode()).hexdigest().encode(),
+                                'log_path': log_path,
+                                'pattern': pattern_str,
+                                'line_preview': line[:200]
+                            }
+                        )
+                        events.append(event)
+                        matches_found += 1
+                        logger.debug(f"Log match in '{log_name}': {line[:80]}...")
+                        break  # Only one event per line
+
+            # Update state
+            state.set_log_file_position(log_path, new_position)
+            state.set_log_file_inode(log_path, current_inode)
+
+        except PermissionError:
+            logger.warning(f"Permission denied reading log file: {log_path}")
+        except Exception as e:
+            logger.error(f"Error monitoring log file '{log_name}': {e}")
+
+    return events
+
+
+def test_log_file(log_path: str, patterns: List[str]) -> Tuple[bool, str]:
+    """
+    Test a log file configuration (for validation).
+
+    Args:
+        log_path: Path to the log file.
+        patterns: List of regex patterns to test.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    if not os.path.exists(log_path):
+        return False, f"Log file not found: {log_path}"
+
+    if not patterns:
+        return False, "No patterns specified"
+
+    # Validate patterns
+    valid_patterns = 0
+    for pattern in patterns:
+        try:
+            re.compile(pattern)
+            valid_patterns += 1
+        except re.error as e:
+            return False, f"Invalid pattern '{pattern}': {e}"
+
+    try:
+        # Check file is readable
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+            # Read first 100 lines to check format
+            lines = []
+            for _ in range(100):
+                line = f.readline()
+                if not line:
+                    break
+                lines.append(line)
+
+        return True, f"Log file OK - {len(lines)} lines sampled, {valid_patterns} pattern(s) valid"
+
+    except PermissionError:
+        return False, f"Permission denied: {log_path}"
+    except Exception as e:
+        return False, f"Error reading log file: {e}"
 
 
 # =============================================================================
