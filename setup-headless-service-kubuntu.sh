@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SERVICE_NAME="e2nb"
-RUN_USER="e2nb"
-RUN_GROUP="e2nb"
-INSTALL_DIR="/opt/e2nb"
-CONFIG_DIR="/etc/e2nb"
-LOG_DIR="/var/log/e2nb"
+SERVICE_NAME="e2nb2"
+RUN_USER="e2nb2"
+RUN_GROUP="e2nb2"
+INSTALL_DIR="/opt/e2nb2"
+CONFIG_DIR="/etc/e2nb2"
+LOG_DIR="/var/log/e2nb2"
 STATE_FILE="${INSTALL_DIR}/e2nb_state.json"
 VENV_DIR="${INSTALL_DIR}/.venv"
 PYTHON_BIN="python3"
