@@ -64,6 +64,7 @@ from e2nb_core import (
     check_log_files,
     ConfigurationError,
     AIOSMTPD_AVAILABLE,
+    SLACK_AVAILABLE,
     DEFAULT_CHECK_INTERVAL,
     DEFAULT_IMAP_PORT,
     DEFAULT_POP3_PORT,
@@ -318,6 +319,23 @@ class EmailMonitorDaemon:
 
         logging.info(f"Enabled notification methods: {', '.join(enabled_methods)}")
 
+        # Validate dependencies for enabled notification methods
+        if self.config.getboolean('Slack', 'enabled', fallback=False):
+            if not SLACK_AVAILABLE:
+                logging.error(
+                    "Slack is enabled but slack_sdk is not installed. "
+                    "Install it with: pip install slack_sdk"
+                )
+            else:
+                slack_channel = self.config.get('Slack', 'channel', fallback='')
+                slack_token = self.config.get('Slack', 'token', fallback='')
+                if not slack_token:
+                    logging.error("Slack is enabled but no bot token is configured")
+                if not slack_channel:
+                    logging.error("Slack is enabled but no channel is configured")
+                else:
+                    logging.info(f"Slack configured: channel={slack_channel}, token={'set' if slack_token else 'MISSING'}")
+
         # Start SMTP receiver if enabled
         smtp_recv_config = SmtpReceiverConfig.from_config(self.config)
         self._smtp_receiver_config = smtp_recv_config  # Track initial config for reload reconciliation
@@ -385,6 +403,24 @@ class EmailMonitorDaemon:
         """Main monitoring loop with per-source interval tracking and UID-based IMAP."""
         # Initialize state for monitoring sources
         monitor_state = MonitorState()
+
+        # Log IMAP UID tracking state for diagnostics
+        email_config = EmailConfig.from_config(self.config)
+        if email_config.username and email_config.protocol == 'imap':
+            imap_key = f"{email_config.imap_server}:{email_config.username}"
+            last_uid = monitor_state.get_imap_last_uid(
+                email_config.imap_server, email_config.username
+            )
+            if last_uid > 0:
+                logging.info(
+                    f"IMAP UID tracking: resuming from UID {last_uid} for {imap_key} "
+                    f"(only emails with UID > {last_uid} will be processed)"
+                )
+            else:
+                logging.info(
+                    f"IMAP UID tracking: no previous state for {imap_key} — "
+                    "will process all unread emails on first check"
+                )
 
         # Load monitoring source configs (will be refreshed on reload)
         rss_config = RssFeedConfig.from_config(self.config)
