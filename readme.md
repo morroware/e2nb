@@ -999,7 +999,13 @@ kill -HUP $(pgrep -f e2nb-headless)
 
 ### Systemd Service
 
-Create `/etc/systemd/system/e2nb.service`:
+For an automated Kubuntu/Ubuntu setup (installs dependencies, creates a service account, builds a virtualenv, writes the service file, enables and starts the service), run:
+
+```bash
+sudo ./setup-headless-service-kubuntu.sh
+```
+
+You can still perform a manual setup if you prefer. Create `/etc/systemd/system/e2nb.service`:
 
 ```ini
 [Unit]
