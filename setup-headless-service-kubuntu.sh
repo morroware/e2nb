@@ -158,14 +158,13 @@ StandardError=journal
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=${LOG_DIR} ${STATE_FILE}
+ReadWritePaths=${INSTALL_DIR} ${LOG_DIR} ${CONFIG_DIR}
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 ProtectKernelModules=yes
 LockPersonality=yes
-MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
