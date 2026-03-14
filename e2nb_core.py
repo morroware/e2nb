@@ -3609,6 +3609,12 @@ class NotificationDispatcher:
 
         # Determine which channels should receive this notification
         enabled_channels = self._get_enabled_channels()
+        if not enabled_channels:
+            logger.warning("No notification channels are enabled — nothing to dispatch")
+            return results
+
+        logger.debug(f"Dispatching to enabled channels: {enabled_channels}")
+
         if self.notification_rules.enabled:
             channel_decisions = self.notification_rules.get_channel_decisions(
                 notification, enabled_channels, source_type, severity
